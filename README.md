@@ -12,10 +12,11 @@ Running ``./make_wiki-search.sh`` will initiate the build.  The script will prov
 
 ## Required tools:
 
-1. Python2
-2. Curl
-3. bzcat (part of the bzip2 package)
-4. pv (optional to display a progress bar while decompressing)
+1. [Rampart JavaScript](https://github.com/aflin/rampart)
+2. Python2
+3. Curl
+4. bzcat (part of the bzip2 package)
+5. pv (optional to display a progress bar while decompressing)
 
 After the search is build, the webserver may be started with ``rampart ./wksearch.js``.
 
