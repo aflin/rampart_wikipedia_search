@@ -71,9 +71,9 @@ mkdir -p "$DATADIR/txt" || die "could not make directory $DATADIR/txt"
 done || die "failed to extract text from enwiki-latest-pages-articles.xml"
 
 echo "importing data"
-rampart import.js
+$RP import.js
 echo "creating text index"
-rampart mkindex.js
+$RP mkindex.js
 
 #echo "Now you can run \"rampart import.js\" and \"rampart mkindex.js\" to create the database."
 #echo "After it is made, \"rampart wksearch.js\" will start the server"

@@ -1,5 +1,5 @@
 var Sql=require("rampart-sql");
-var sql=new Sql.init("./wikidb",true); /* true means make db if it doesn't exist */
+var sql=new Sql.init(process.scriptPath + "/web_server/data/wikidb");
 
 /*
   This statement creates the full text index on the Doc field.
