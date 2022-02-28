@@ -18,7 +18,8 @@ Running ``./make_wiki-search.sh`` will initiate the build.  The script will prov
 4. bzcat (part of the bzip2 package)
 5. pv (optional to display a progress bar while decompressing)
 
-After the search is build, the webserver may be started with ``rampart ./wksearch.js``.
+After the search is build, the webserver may be started in the 'web_server'
+directory with ``./start_wikipedia_web_server.sh``.
 
 ## Demo:
 
