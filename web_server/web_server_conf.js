@@ -12,7 +12,7 @@ var server=require("rampart-server");
 rampart.globalize(rampart.utils);
 
 // a message to print after server has started"
-var message = "Go to http://localhost:8088/apps/search.html to search.";
+var message = "Go to http://localhost:8088/apps/wikipedia_search/search.html to search.";
 
 /*
    a convenient global object to hold configs and
