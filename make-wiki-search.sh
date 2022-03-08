@@ -70,6 +70,11 @@ mkdir -p "$DATADIR/txt" || die "could not make directory $DATADIR/txt"
 	printf "%s            \r" "$line"; 
 done || die "failed to extract text from enwiki-latest-pages-articles.xml"
 
+if [ ! -e ./web_server/data/docs ]; then
+    mkdir -p ./web_server/data/docs || die "could not create directory ./web_server/data/docs"
+fi
+
+
 echo "importing data"
 $RP import.js
 echo "creating text index"
