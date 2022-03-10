@@ -18,8 +18,8 @@ function check_err() {
 }
 
 // init the database, create if necessary.
-// if the directory "./wikidb" exists, but is not a texis db, an error will be thrown
-var sql=new Sql.init(process.scriptPath + "/web_server/data/wikidb",true); // true means make db if it doesn't exist
+// if the directory "./wikipedia_search" exists, but is not a texis db, an error will be thrown
+var sql=new Sql.init(process.scriptPath + "/web_server/data/wikipedia_search",true); // true means make db if it doesn't exist
 
 // if newly created, we will get a message via sql.errMsg starting with '100';
 if(sql.errMsg.length) {
@@ -47,7 +47,7 @@ if( sql.one("select * from SYSTABLES where NAME='wikitext';") ){
 
     // ask to drop the existing "wikitext" table
     while (resp!='y') {
-        printf('The table "wikitext" already exists in the "./web_server/data/wikidb" database directory.\n   Delete it? (y/N): ');
+        printf('The table "wikitext" already exists in the "./web_server/data/wikipedia_search" database directory.\n   Delete it? (y/N): ');
         fflush(stdout); //flush text after newline above
         resp = getresp("n");
         if(resp == 'n') {
