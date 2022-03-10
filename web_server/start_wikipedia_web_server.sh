@@ -10,7 +10,7 @@ if [ "$RP" == "" ]; then
 	exit 1;
 fi
 
-ls ./data/wikidb/ 2>&1 1>/dev/null || die "could not find './data/wikidb/' directory.  Has the db been build?"
+ls ./data/wikipedia_search/ 2>&1 1>/dev/null || die "could not find './data/wikipedia_search/' directory.  Has the db been build?"
 
 $RP ./web_server_conf.js
 

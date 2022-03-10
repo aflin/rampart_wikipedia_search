@@ -16,7 +16,7 @@ var Sql=require("rampart-sql");
 // process.scriptPath is the path of the web_server_conf.js, not
 // the path of this module script. For the path of this module, 
 // use 'module.path'.
-var db=process.scriptPath + '/data/wikidb';
+var db=process.scriptPath + '/data/wikipedia_search';
 
 // Open the db.
 var sql=new Sql.init(db);
