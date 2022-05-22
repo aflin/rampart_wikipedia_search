@@ -23,4 +23,4 @@ directory with ``./start_wikipedia_web_server.sh``.
 
 ## Demo:
 
-A demo running on the Raspberry Pi Zero can be found [here](https://rampart.dev/apps/demos/?demo=wikipedia).
+A demo running on the Raspberry Pi Zero can be found [here](https://rampart.dev/apps/site/run_demo.html?demo=wikipedia).
