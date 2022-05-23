@@ -89,6 +89,7 @@ function procfilex(file){
   //                           0       1      2         3    4    5 6       7
   return rexFile('>><doc id\\="=\\digit+!title*title\\="=[^"]+[^>]+>=!</doc>*',
            file,
+           {delimiter: '</doc>'},
            function(match,matchinfo,i){
              var sm=matchinfo.submatches;
              var ret=sql.exec("insert into wikitext values (?,?,?);",
