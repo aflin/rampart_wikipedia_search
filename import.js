@@ -11,11 +11,16 @@ rampart.globalize(rampart.utils);
 
 // Function to check for and handle sql errors
 function check_err() {
-    if(sql.errMsg.length) {
+    if(sql.errMsg.length && ! /^100/.test(sql.errMsg) ) {
         console.log(sql.errMsg);
         process.exit(1);
     }
+    sql.errMsg="";
 }
+
+// make sure data dir is there:
+if(!stat(process.scriptPath + "/web_server/data"))
+    mkdir(process.scriptPath + "/web_server/data");
 
 // init the database, create if necessary.
 // if the directory "./wikipedia_search" exists, but is not a texis db, an error will be thrown
@@ -65,7 +70,6 @@ printf("creating table wikitext\n");
 sql.exec("create table wikitext ( Id int, Title varchar(16), Doc varchar(1024) );");
 check_err();
 
-
 /*  Sample record:
       <doc id="12" url="https://en.wikipedia.org/wiki?curid=12" title="Anarchism">...</doc>
 */
@@ -105,7 +109,7 @@ function procfilex(file){
      from within make-wiki-search.sh                      */
 function wimport() {
 
-    var datadir="./wikidata/txt/";
+    var datadir=process.scriptPath + "/wikidata/txt/";
     var ret;
     var ndocs=0;
 
