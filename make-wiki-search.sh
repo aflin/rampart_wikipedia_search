@@ -6,6 +6,7 @@ die () {
 }
 
 # the full english wikipedia dump
+FILE="enwiki-latest-pages-articles.xml"
 DUMPURL="https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2"
 
 # or a smaller file for testing.  This file will likely disappear in a few months.
@@ -27,7 +28,7 @@ ME=`whoami`
 
 EXTRACTOR="./WikiExtractor.py"
 
-DATADIR="./wikidata"
+DATADIR="./en_wikidata"
 HAVEPV=""
 
 curl --version &>/dev/null || die "curl must be installed and in the current \$PATH before running this script"
@@ -39,16 +40,12 @@ pv --help &>/dev/null && {
 	echo
 }
 
-echo "In order to create the wikipedia demo search, several directories will be made and the current English Wikipedia dump will be downloaded."
-echo "The dump file is very large (>17Gb) and will also take significant time to unzip."
+echo "In order to create the wikipedia demo search, several directories will be made and the current Wikipedia dump will be downloaded."
+echo "The English dump file is very large (>17Gb), as are others, and will also take significant time to unzip."
 echo "The file will be downloaded using curl.  If interrupted, please run this script again and curl will attempt to resume the download."
 echo "If an old version of enwiki-latest-pages-articles.xml.bz2 exists in this directory, please quit and move/delete that file first in order to download the latest dump."
-echo
-echo "If you wish to just test this build with a small subsection of the English Wikipedia (takes minutes rather than hours),"
-echo "edit this file and change the DUMPURL variable to a smaller partial-dump file from https://dumps.wikimedia.org/enwiki/latest/"
-echo "An example URL pointing to a small partial-dump xml file is included on line 13 of this file."
 
-read -p "Continue [y|N]? " -n 1 -r
+read -p "Continue [y|N]? "
 echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]
 then
@@ -56,18 +53,34 @@ then
     exit 1
 fi
 
-echo "Downloading enwiki-latest-pages-articles.xml.bz2 to current directory"
-curl -C - -o enwiki-latest-pages-articles.xml.bz2 $DUMPURL || die "download failed"
+echo "Which Wikipedia dump would you like to download?"
+echo "  Use language code es for Spanish, en for English, de for German, fr for French, etc."
+echo
+read -p "Lang code (enter for English): " LC
+
+if [ "$LC" == "" ]; then
+    LC="en"
+else
+    FILE="${LC}wiki-latest-pages-articles.xml"
+    DUMPURL="https://dumps.wikimedia.org/${LC}wiki/latest/${LC}wiki-latest-pages-articles.xml.bz2"
+    DATADIR="./${LC}_wikidata"
+
+fi
+
+curl -I $DUMPURL | grep -q 200 || die "Error: Could not find file $DUMPURL"
+
+echo "Downloading ${LC}wiki-latest-pages-articles.xml.bz2 to current directory"
+curl -C - -o "${FILE}.bz2" $DUMPURL || die "download failed"
 
 echo "Decompressing..."
 
-if [ -e enwiki-latest-pages-articles.xml ]; then
+if [ -e "$FILE" ]; then
     REPLY="";
     while [[ ! $REPLY  =~ ^[oO]$ ]] && [[ ! $REPLY  =~ ^[cC]$ ]]; do
        if [ "$REPLY" != "" ]; then
             echo "invalid response"
        fi
-       echo "enwiki-latest-pages-articles.xml exists.";
+       echo "$FILE exists.";
        read -p "[o]verwrite or [c]ontinue with existing" -n 1 -r
        echo
     done
@@ -76,16 +89,16 @@ if [ -e enwiki-latest-pages-articles.xml ]; then
 	echo
         if [ "$HAVEPV" == "1" ] ; then
                 # we need to cat the file since it is too large for bzcat on a 32bit system.
-                cat enwiki-latest-pages-articles.xml.bz2 | pv -s $(ls -l enwiki-latest-pages-articles.xml.bz2 | awk '{print $5}') | bzcat -d > enwiki-latest-pages-articles.xml || die "Failed to decompress file"
+                cat "${FILE}.bz2" | pv -s $(ls -l "$FILE" | awk '{print $5}') | bzcat -d > "$FILE" || die "Failed to decompress file"
         else
-                cat enwiki-latest-pages-articles.xml.bz2 | bzcat -d > enwiki-latest-pages-articles.xml || die "Failed to decompress file"
+                cat "$FILE.bz2" | bzcat -d > "$FILE" || die "Failed to decompress file"
         fi
     fi
 else
     if [ "$HAVEPV" == "1" ] ; then
-            cat enwiki-latest-pages-articles.xml.bz2 | pv -s $(du -sb enwiki-latest-pages-articles.xml.bz2 | awk '{print $1}') | bzcat -d > enwiki-latest-pages-articles.xml || die "Failed to decompress file"
+            cat "${FILE}.bz2" | pv -s $(du -sb "${FILE}.bz2" | awk '{print $1}') | bzcat -d > "${FILE}" || die "Failed to decompress file"
     else
-            cat enwiki-latest-pages-articles.xml.bz2 | bzcat -d > enwiki-latest-pages-articles.xml || die "Failed to decompress file"
+            cat "${FILE}.bz2" | bzcat -d > "${FILE}" || die "Failed to decompress file"
     fi
 fi
 
@@ -109,15 +122,15 @@ if [[ $REPLY =~ ^[oO]$ ]]; then
 fi
 
 if [ "$REPLY" = "" ]; then
-    echo "Extracting text from enwiki-latest-pages-articles.xml"
+    echo "Extracting text from ${FILE}"
 
     mkdir -p "$DATADIR/txt" || die "could not make directory $DATADIR/txt"
 
-    #./WikiExtractor.py -o "$DATADIR/txt" enwiki-latest-pages-articles.xml|| die "failed to extract text from enwiki-latest-pages-articles.xml"
-    ./WikiExtractor.py -o "$DATADIR/txt" enwiki-latest-pages-articles.xml 2>&1 | tee extractor-output.txt | while read i; do 
+    #./WikiExtractor.py -o "$DATADIR/txt" "${FILE}"|| die "failed to extract text from "${FILE}""
+    ./WikiExtractor.py -o "$DATADIR/txt" "${FILE}" 2>&1 | tee extractor-output.txt | while read i; do 
         line=$(echo -n $i | grep -oE '[[:digit:]]+.+'); 
         printf "%s            \r" "$line"; 
-    done || die "failed to extract text from enwiki-latest-pages-articles.xml"
+    done || die "failed to extract text from "${FILE}""
 fi
 
 if [ ! -e ./web_server/data ]; then
@@ -126,9 +139,9 @@ fi
 
 
 echo "importing data"
-$RP import.js && {
+$RP import.js ${LC} && {
     echo "creating text index"
-    $RP mkindex.js
+    $RP mkindex.js ${LC}
 } || die "Import and index creation were aborted."
 
 if [ "$ME" == "root" ]; then

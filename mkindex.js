@@ -1,5 +1,11 @@
 var Sql=require("rampart-sql");
-var sql=new Sql.init(process.scriptPath + "/web_server/data/wikipedia_search");
+
+var lc="en";
+if(process.argv.length > 1 && process.argv[2].length)
+    lc=process.argv[2];
+
+
+var sql=new Sql.init(process.scriptPath + `/web_server/data/${lc}_wikipedia_search`);
 
 /*
   This statement creates the full text index on the Doc field.

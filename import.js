@@ -22,9 +22,13 @@ function check_err() {
 if(!stat(process.scriptPath + "/web_server/data"))
     mkdir(process.scriptPath + "/web_server/data");
 
+var lc="en";
+if(process.argv.length > 1 && process.argv[2].length)
+    lc=process.argv[2];
+
 // init the database, create if necessary.
 // if the directory "./wikipedia_search" exists, but is not a texis db, an error will be thrown
-var sql=new Sql.init(process.scriptPath + "/web_server/data/wikipedia_search",true); // true means make db if it doesn't exist
+var sql=new Sql.init(process.scriptPath + `/web_server/data/${lc}_wikipedia_search`,true); // true means make db if it doesn't exist
 
 // if newly created, we will get a message via sql.errMsg starting with '100';
 if(sql.errMsg.length) {
@@ -52,7 +56,7 @@ if( sql.one("select * from SYSTABLES where NAME='wikitext';") ){
 
     // ask to drop the existing "wikitext" table
     while (resp!='y') {
-        printf('The table "wikitext" already exists in the "./web_server/data/wikipedia_search" database directory.\n   Delete it? (y/N): ');
+        printf(`The table "wikitext" already exists in the "./web_server/data/${lc}_wikipedia_search" database directory.\n   Delete it? (y/N): `);
         fflush(stdout); //flush text after newline above
         resp = getresp("n");
         if(resp == 'n') {
@@ -109,7 +113,7 @@ function procfilex(file){
      from within make-wiki-search.sh                      */
 function wimport() {
 
-    var datadir=process.scriptPath + "/wikidata/txt/";
+    var datadir=process.scriptPath + `/${lc}_wikidata/txt/`;
     var ret;
     var ndocs=0;
 
