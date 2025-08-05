@@ -126,7 +126,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <div id="main" style="padding-bottom:30px;background-color: white; position: absolute; left:200px; top:0px; min-height: 300px; overflow-x: hidden; padding-right: 20px; padding-left: 30px; box-sizing: border-box; width: 600px;">
       <form id="mf" action="/apps/wikipedia_search/search.html">
         <div style="width:100%%">
-          <span style="white-space:nowrap;display:block;width:500px;height:39px;position:fixed;background-color: white;z-index:10;border-bottom: lightGray 1px solid; padding-top:15px;padding-bottom:15px">
+          <span style="white-space:nowrap;display:block;width:550px;height:50px;position:fixed;background-color: white;z-index:10;border-bottom: lightGray 1px solid; padding-top:15px;padding-bottom:15px">
             <div class="wtitle">%s</div>
             <table style="background-color: white; width:100%%">
               <tr>
