@@ -225,9 +225,11 @@ function search(req) {
         else
             sql.set({likeprows:100}); //reset to default in case previously set
 
-//        try {
+        try {
             sql.set({useDerivations: lc});
-//        } catch(e) {};
+            // a lone term in quotes turns off equiv (i.e. '"myterm"' -> '~myterm')
+            q=Sql.sandr('"=[^"\\space]+"=' , "~\\2 ",q);
+        } catch(e) {};
 
         sql.exec(
             /* The SQL statement:
