@@ -96,7 +96,7 @@ if [ -e "$FILE" ]; then
     fi
 else
     if [ "$HAVEPV" == "1" ] ; then
-            cat "${FILE}.bz2" | pv -s $(du -sb "${FILE}.bz2" | awk '{print $1}') | bzcat -d > "${FILE}" || die "Failed to decompress file"
+            cat "${FILE}.bz2" | pv -s $(ls -l "${FILE}.bz2" | awk '{print $5}') | bzcat -d > "${FILE}" || die "Failed to decompress file"
     else
             cat "${FILE}.bz2" | bzcat -d > "${FILE}" || die "Failed to decompress file"
     fi

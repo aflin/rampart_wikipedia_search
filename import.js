@@ -23,7 +23,7 @@ if(!stat(process.scriptPath + "/web_server/data"))
     mkdir(process.scriptPath + "/web_server/data");
 
 var lc="en";
-if(process.argv.length > 1 && process.argv[2].length)
+if(process.argv.length > 2 && process.argv[2].length)
     lc=process.argv[2];
 
 // init the database, create if necessary.
@@ -100,8 +100,10 @@ function procfilex(file){
            {delimiter: '</doc>'},
            function(match,matchinfo,i){
              var sm=matchinfo.submatches;
+             //remove non-breaking spaces
+             var cleaned = Sql.sandr('\\xc2\\xa0=', ' ', sm[7] );
              var ret=sql.exec("insert into wikitext values (?,?,?);",
-               [sm[1], sm[4], sm[7]]
+               [sm[1], sm[4], cleaned]
              );
              check_err();
            }

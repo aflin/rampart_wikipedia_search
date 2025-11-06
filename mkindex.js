@@ -1,7 +1,7 @@
 var Sql=require("rampart-sql");
 
 var lc="en";
-if(process.argv.length > 1 && process.argv[2].length)
+if(process.argv.length > 2 && process.argv[2].length)
     lc=process.argv[2];
 
 
