@@ -6,14 +6,19 @@ MacOs.  The search is powerful and efficient enough to be run on hardware as
 small as a Raspberry Pi Zero.
 
 ## Usage:
-Running ``./make_wiki-search.sh`` will initiate the build. It will ask for the version (such as 'en' or 'de') and can be run multiple times with different languages. The script will provide some information and then:
+Running ``./make_wiki-search.sh`` will initiate the build.  It will ask for
+the version (such as 'en' or 'de') and can be run multiple times with
+different languages.  The script will provide some information and then:
 
 1. Download the latest wikipedia dump from dumps.wikipedia.org for the chosen language.
 2. Decompress the downloaded file.
 3. Import the data using import.js or import-multithread.js.
 4. Create the index using mkindex.js
 
-## To build the semantic search
+After it is built ``rampart web_server/web_server_conf.js start`` will start
+the server.  It will be available at http://localhost:8088/apps/wikipedia_search/search.html
+
+## To build the additional Semantic Search:
 
 The semantic search uses rampart-faiss and rampart-llamacpp to build perform a
 semantic search.  The build splits the wikipedia articles into paragraphs,
