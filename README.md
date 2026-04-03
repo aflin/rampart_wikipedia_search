@@ -38,15 +38,16 @@ After building with ``./make_wiki-search.sh``:
   web_server/web_server_start.js and
   web_server/apps/wikipedia_search/vecsearch.js to remove the reranking
   step.  The reranking step mostly helps to bring more relevant results to
-  the top (i.e.  it pull the ``"Kill Bill: Volume 1"`` paragraph mentioning
+  the top (i.e.  it pulls the ``"Kill Bill: Volume 1"`` paragraph mentioning
   David Carradine and a paragraph from the ``"David Carradine"`` page to the top
-  two results for a search like ``"what is the name of the actor that played
-  bill in kill bill"`` where they would otherwise be out of the top 10, but in
-  the top 30).  If that is not needed, it can be skipped to save resources
-  and significantly speed up the search.
-4. A demo will be available at http://localhost:8088/apps/wikipedia_search/vecsearch.html
+  two results for a search like 
+  ``"what is the name of the actor that played bill in kill bill"`` where 
+  they would otherwise be out of the top 10, but in the top 30).  If that is
+  not needed, it can be skipped to save resources and significantly speed up
+  the search.
+4. Restart the server ``rampart web_server_conf.js restart``.
+5. A demo will be available at http://localhost:8088/apps/wikipedia_search/vecsearch.html
   A JSON endpoint more suitable for a RAG pipeline will be available at http://localhost:8088/apps/wikipedia_search/vecsearch.json
-5. Restart the server ``rampart web_server_conf.js restart``.
 
 ## Required:
 
@@ -59,7 +60,7 @@ After building with ``./make_wiki-search.sh``:
 
 Note: python is no longer required. The wikiparser.js script with parallel
 build will now reduce the run time of the parallel ``./make_wiki-search.sh``
-to hours instead of days, with better text extraction.
+build to hours instead of days, with better text extraction.
  
 ## Demo:
 
