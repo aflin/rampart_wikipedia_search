@@ -26,9 +26,6 @@ fi
 
 ME=`whoami`
 
-EXTRACTOR="./WikiExtractor.py"
-
-DATADIR="./en_wikidata"
 HAVEPV=""
 
 curl --version &>/dev/null || die "curl must be installed and in the current \$PATH before running this script"
@@ -40,20 +37,7 @@ pv --help &>/dev/null && {
 	echo
 }
 
-echo "In order to create the wikipedia demo search, several directories will be made and the current Wikipedia dump will be downloaded."
-echo "The English dump file is very large (>17Gb), as are others, and will also take significant time to unzip."
-echo "The file will be downloaded using curl.  If interrupted, please run this script again and curl will attempt to resume the download."
-echo "If an old version of enwiki-latest-pages-articles.xml.bz2 exists in this directory, please quit and move/delete that file first in order to download the latest dump."
-
-read -p "Continue [y|N]? "
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]
-then
-    echo "bye"
-    exit 1
-fi
-
-echo "Which Wikipedia dump would you like to download?"
+echo "Which Wikipedia dump would you like to use?"
 echo "  Use language code es for Spanish, en for English, de for German, fr for French, etc."
 echo
 read -p "Lang code (enter for English): " LC
@@ -63,83 +47,93 @@ if [ "$LC" == "" ]; then
 else
     FILE="${LC}wiki-latest-pages-articles.xml"
     DUMPURL="https://dumps.wikimedia.org/${LC}wiki/latest/${LC}wiki-latest-pages-articles.xml.bz2"
-    DATADIR="./${LC}_wikidata"
-
 fi
 
-curl -I $DUMPURL | grep -q 200 || die "Error: Could not find file $DUMPURL"
-
-echo "Downloading ${LC}wiki-latest-pages-articles.xml.bz2 to current directory"
-curl -C - -o "${FILE}.bz2" $DUMPURL || die "download failed"
-
-echo "Decompressing..."
-
+# Check if the uncompressed XML dump already exists
 if [ -e "$FILE" ]; then
-    REPLY="";
-    while [[ ! $REPLY  =~ ^[oO]$ ]] && [[ ! $REPLY  =~ ^[cC]$ ]]; do
-       if [ "$REPLY" != "" ]; then
-            echo "invalid response"
-       fi
-       echo "$FILE exists.";
-       read -p "[o]verwrite or [c]ontinue with existing" -n 1 -r
-       echo
-    done
+    FILESIZE=$(ls -lh "$FILE" | awk '{print $5}')
+    echo
+    echo "Found existing dump file: $FILE ($FILESIZE)"
+    read -p "Use this file? [Y|n] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[nN]$ ]]; then
+        echo "OK, will download a fresh copy."
+    else
+        echo "Using existing $FILE"
+        SKIP_DOWNLOAD=1
+    fi
+fi
 
-    if [[ $REPLY =~ ^[oO]$ ]]; then
-	echo
-        if [ "$HAVEPV" == "1" ] ; then
-                # we need to cat the file since it is too large for bzcat on a 32bit system.
-                cat "${FILE}.bz2" | pv -s $(ls -l "$FILE" | awk '{print $5}') | bzcat -d > "$FILE" || die "Failed to decompress file"
-        else
+if [ "$SKIP_DOWNLOAD" != "1" ]; then
+    echo
+    echo "The Wikipedia dump file is very large (>17Gb for English) and will take"
+    echo "significant time to download and decompress."
+    echo "The file will be downloaded using curl.  If interrupted, run this script"
+    echo "again and curl will attempt to resume the download."
+    echo
+
+    read -p "Continue with download [y|N]? "
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "bye"
+        exit 1
+    fi
+
+    curl -I $DUMPURL 2>/dev/null | grep -q 200 || die "Error: Could not find file $DUMPURL"
+
+    echo "Downloading ${LC}wiki-latest-pages-articles.xml.bz2 to current directory"
+    curl -C - -o "${FILE}.bz2" $DUMPURL || die "download failed"
+
+    echo "Decompressing..."
+
+    if [ -e "$FILE" ]; then
+        REPLY="";
+        while [[ ! $REPLY  =~ ^[oO]$ ]] && [[ ! $REPLY  =~ ^[cC]$ ]]; do
+           if [ "$REPLY" != "" ]; then
+                echo "invalid response"
+           fi
+           echo "$FILE already exists.";
+           read -p "[o]verwrite or [c]ontinue with existing? " -n 1 -r
+           echo
+        done
+
+        if [[ $REPLY =~ ^[oO]$ ]]; then
+            echo
+            if [ "$HAVEPV" == "1" ] ; then
+                cat "${FILE}.bz2" | pv -s $(ls -l "${FILE}.bz2" | awk '{print $5}') | bzcat -d > "$FILE" || die "Failed to decompress file"
+            else
                 cat "$FILE.bz2" | bzcat -d > "$FILE" || die "Failed to decompress file"
+            fi
+        fi
+    else
+        if [ "$HAVEPV" == "1" ] ; then
+            cat "${FILE}.bz2" | pv -s $(ls -l "${FILE}.bz2" | awk '{print $5}') | bzcat -d > "${FILE}" || die "Failed to decompress file"
+        else
+            cat "${FILE}.bz2" | bzcat -d > "${FILE}" || die "Failed to decompress file"
         fi
     fi
-else
-    if [ "$HAVEPV" == "1" ] ; then
-            cat "${FILE}.bz2" | pv -s $(ls -l "${FILE}.bz2" | awk '{print $5}') | bzcat -d > "${FILE}" || die "Failed to decompress file"
-    else
-            cat "${FILE}.bz2" | bzcat -d > "${FILE}" || die "Failed to decompress file"
-    fi
 fi
 
-REPLY="";
-if [ -e $DATADIR/txt/AA ] ; then
-    while [[ ! $REPLY  =~ ^[oO]$ ]] && [[ ! $REPLY  =~ ^[cC]$ ]]; do
-       if [ "$REPLY" != "" ]; then
-            echo "invalid response"
-       fi
-       echo "There appears to be text already extracted in the $DATADIR/txt directory"
-       echo "Should we overwrite that data and start again or use the data already present?"
-       read -p "[o]verwrite or [c]ontinue with existing" -n 1 -r
-       echo
-    done
-fi
-
-if [[ $REPLY =~ ^[oO]$ ]]; then
-    echo "removing content in $DATADIR/txt/" 
-    rm -rf $DATADIR/txt/*
-    REPLY="";
-fi
-
-if [ "$REPLY" = "" ]; then
-    echo "Extracting text from ${FILE}"
-
-    mkdir -p "$DATADIR/txt" || die "could not make directory $DATADIR/txt"
-
-    #./WikiExtractor.py -o "$DATADIR/txt" "${FILE}"|| die "failed to extract text from "${FILE}""
-    ./WikiExtractor.py -o "$DATADIR/txt" "${FILE}" 2>&1 | tee extractor-output.txt | while read i; do 
-        line=$(echo -n $i | grep -oE '[[:digit:]]+.+'); 
-        printf "%s            \r" "$line"; 
-    done || die "failed to extract text from "${FILE}""
+if [ ! -e "$FILE" ]; then
+    die "Dump file $FILE not found. Cannot continue."
 fi
 
 if [ ! -e ./web_server/data ]; then
     mkdir -p ./web_server/data || die "could not create directory ./web_server/data"
 fi
 
+echo "Scanning, expanding, and importing articles from ${FILE}"
+echo "This uses the wikiparser module to expand templates and extract text."
+echo
 
-echo "importing data"
-$RP import.js ${LC} && {
+IMPORT_SCRIPT="import.js"
+read -p "Use parallel import (multiple CPUs)? [Y|n] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[nN]$ ]]; then
+    IMPORT_SCRIPT="import-multithread.js"
+fi
+
+$RP $IMPORT_SCRIPT ${LC} && {
     echo "creating text index"
     $RP mkindex.js ${LC}
 } || die "Import and index creation were aborted."

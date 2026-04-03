@@ -1,351 +1,374 @@
-
-// the http server module
-var server=require("rampart-server");
-
-/* 
-    Put printf et. al. into the global namespace
-    For convenience so that one can use
-        printf("...")
-    in place of
-        rampart.utils.printf("...");
-*/
-rampart.globalize(rampart.utils);
-
-// a message to print after server has started"
-var message = "Go to http://localhost:8088/apps/wikipedia_search/search.html to search.";
+#!/usr/bin/env rampart
 
 /*
-   a convenient global object to hold configs and
-   locations that we might need to access from
-   within modules
-*/ 
+the server can be started by running:
+  rampart web_server_config.js
+         or
+  rampart web_server_config.js start
+
+Help:
+  ./web_server_conf.js help
+  usage:
+    rampart web_server_conf.js [start|stop|restart|letssetup|status|dump|help]
+        start     -- start the http(s) server
+        stop      -- stop the http(s) server
+        restart   -- stop and restart the http(s) server
+        letssetup -- start http only to allow letsencrypt verification
+        status    -- show status of server processes
+        dump      -- dump the config object used for server.start()
+        help      -- show this message
+*/
+
+//set working directory to the location of this script
+var working_directory = process.scriptPath;
+
+/* ***********************  SEMANTIC SEARCH ADDITIONS ********************** */
+
+// these should be in the main director below this one (web_server/..)
+var faiss_index_name  = "wikivecs-minilm.OPQ48_IVF16384_PQ48_faiss.complete";
+var llama_model_name = "all-minilm-l6-v2_f16.gguf";
+var llama_rankr_name = "bge-reranker-v2-m3-Q8_0.gguf";
+
+var faiss_index = false;
+var llama_model = false;
+var llama_rankr = false;
+
+try {
+    faiss_index = rampart.utils.realPath(working_directory + "/../" + faiss_index_name);
+    llama_model = rampart.utils.realPath(working_directory + "/../" + llama_model_name);
+    llama_rankr = rampart.utils.realPath(working_directory + "/../" + llama_rankr_name);
+} catch(e){}
+
+// cuda does not work with forking, so we need to load after fork
+function init_langtools() {
+    rampart.localize(rampart.utils);
+    var g=global;
+
+    if(!stat(working_directory + 'data/en_wikipedia_search/wikivecs.tbl')) {
+        fprintf(stderr, "data/en_wikipedia_search/wikivecs.tbl not found.  Semantic search disabled\n", faiss_index_name);
+        return;
+    }
+
+    if(!faiss_index) {
+        fprintf(stderr, "faiss index '%s' not found.  Semantic search disabled\n", faiss_index_name);
+        return;
+    }
+
+    if(!llama_model) {
+        fprintf(stderr, "llama model '%s' not found.  Semantic search disabled\n", llama_model_name);
+        return;
+    }
+
+    if(!llama_rankr) {
+        fprintf(stderr, "llama rerank model '%s' not found.  Semantic search disabled\n", llama_rankr_name);
+        return;
+    }
+
+    try {
+        g.faiss = require('rampart-faiss');
+    } catch(e) {
+        fprintf(stderr, "rampart-faiss module not found.  Semantic search disabled\n");
+        return;
+    }
+
+    try {
+        g.llamacpp = require('rampart-llamacpp');
+    } catch(e) {
+        fprintf(stderr, "rampart-llamacpp module not found.  Semantic search disabled\n");
+        return;
+    }
+
+    try {
+        g.llama_emb = llamacpp.initEmbed(llama_model);
+    } catch(e) {
+        fprintf(stderr, "rampart-llamacpp module failed to load '%s'\n%s\n\n   Log:\n%s\n", llama_model, e.message, llamacpp.getLog());
+        process.exit(1);
+    }
+
+    try {
+        llamacpp.resetLog();
+        g.llama_rr = llamacpp.initRerank(llama_rankr,{ubatch:256});
+    } catch(e) {
+        fprintf(stderr, "rampart-llamacpp module failed to load '%s'\n%s\n\n   Log:\n%s\n", llama_rankr, e.message, llamacpp.getLog());
+        process.exit(1);
+    }
+
+    try {
+        g.faiss_wiki_idx = faiss.openIndexFromFile(faiss_index);
+    } catch(e) {
+        fprintf(stderr, "rampart-faiss module failed to load '%s'\n%s\n", faiss_index, e.message);
+        process.exit(1);
+    }
+
+    printf("faiss index '%s' loaded\nllama model '%s' loaded\n", faiss_index_name, llama_model_name);
+}
+
+
+
+/* ******************* END  SEMANTIC SEARCH ADDITIONS ********************** */
+
+
+/* ****************************************************** *
+ *  UNCOMMENT AND CHANGE DEFAULTS BELOW TO CONFIG SERVER  *
+ * ****************************************************** */
 
 var serverConf = {
-    // for localhost only
-    ipAddr:       "127.0.0.1",
-    ipv6Addr:     "[::1]",
 
-    // bind to all IP Addresses
-    //ipAddr:     "0.0.0.0",
-    //ipv6Addr:   "[::]",
+    postForkFunc: init_langtools,
 
-    ipPort:       8088,
-    ipv6Port:     8088,
-    htmlRoot:     process.scriptPath + "/html",
-    appsRoot:     process.scriptPath + "/apps",
-    wsappsRoot:   process.scriptPath + "/wsapps",
-    dataRoot:     process.scriptPath + "/data",
-    user:         "nobody"
+    //the defaults for full server
+
+    /* ipAddr              String. The ipv4 address to bind   */
+    //ipAddr:              '127.0.0.1',
+
+    /* ipv6Addr            String. The ipv6 address to bind   */
+    //ipv6Addr:            '[::1]',
+
+    /* bindAll             Bool.   Set ipAddr and ipv6Addr to 0.0.0.0 and [::] respectively   */
+    //bindAll:             false,
+
+    /* ipPort              Number. Set ipv4 port   */
+    //ipPort:              8088,
+
+    /* ipv6Port            Number. Set ipv6 port   */
+    //ipv6Port:            8088,
+
+    /* port                Number. Set both ipv4 and ipv6 port if > -1   */
+    //port:                -1,
+
+    /* htmlRoot            String. Root directory from which to serve files   */
+    //htmlRoot:            working_directory + '/html',
+
+    /* appsRoot            String. Root directory from which to serve apps   */
+    //appsRoot:            working_directory + '/apps',
+
+    /* wsappsRoot          String. Root directory from which to serve websocket apps   */
+    //wsappsRoot:          working_directory + '/wsapps',
+
+    /* dataRoot            String. Setting for user scripts   */
+    //dataRoot:            working_directory + '/data',
+
+    /* logRoot             String. Log directory   */
+    //logRoot:             working_directory + '/logs',
+
+    /* irohProxy           Bool.  Whether to start the irohProxy server to proxy http to iroh-webproxy client */
+    //irohProxy:           false,
+
+    /* redirPort           Number. Launch http->https redirect server and set port if < -1  */
+    //redirPort:           -1,
+
+    /* redir               Bool.   Launch http->https redirect server and set to port 80   */
+    //redir:               false,
+
+    /* redirTemp           Bool. If true, and if redir is true or redirPort is set, send a
+                                 302 Moved Temporarily instead of a 301 Moved Permanently   */
+    //redirTemp            false,
+
+    /* accessLog           String. Log file name or null for stdout  */
+    //accessLog:           working_directory + '/logs/access.log',
+
+    /* errorLog            String. error log file name or null for stderr*/
+    //errorLog:            working_directory + '/logs/error.log',
+
+    /* log                 Bool.   Whether to log requests and errors   */
+    //log:                 true,
+
+    /* rotateLogs          Bool.   Whether to rotate the logs   */
+    //rotateLogs:          false,
+
+    /* rotateStart         String. Time to start log rotations   */
+    //rotateStart:         '00:00',
+
+    /* rotateInterval      Number. Interval between log rotations in seconds or
+                           String. One of "hourly", "daily" or "weekly"        */
+    //rotateInterval:      86400,
+
+    /* rotateCount         Number. Maximum number of old log files to keep.
+                                   Oldest logs beyond this count are deleted.  */
+    //rotateCount:         30,
+
+    /* user                String. If started as root, switch to this user
+                                   It is necessary to start as root if using ports < 1024   */
+    //user:                'nobody',
+
+    /* threads             Number. Limit the number of threads used by the server.
+                                   Default (-1) is the number of cores on the system   */
+    //threads:             -1,
+
+    /* secure              Bool.   Whether to use https.  If true sslKeyFile and sslCertFile must be set   */
+    //secure:              false,
+
+    /* sslKeyFile          String. If https, the ssl/tls key file location   */
+    //sslKeyFile:          '',
+
+    /* sslCertFile         String. If https, the ssl/tls cert file location   */
+    //sslCertFile:         '',
+
+    /* selfSign            Bool.   Whether to generate and use a self signed certificate
+                                   If set, secure must be true and sslKeyFile/sslCertFile/letsencrypt must be unset.
+    //selfSign             false,
+
+    /* developerMode       Bool.   Whether JavaScript errors result in 500 and return a stack trace.
+                                   Otherwise errors return 404 Not Found                             */
+    //developerMode:       true,
+
+    /* letsencrypt         String. If using letsencrypt, the 'domain.tld' name for automatic setup of https
+                                   ( sets secure true and looks for '/etc/letsencrypt/live/domain.tld/' directory
+                                     to set sslKeyFile and sslCertFile ).
+                                   ( also sets "port" to 443 ).                                                      */
+    //letsencrypt:         "",     //empty string - don't configure using letsencrypt
+
+    /* rootScripts         Bool.   Whether to treat *.js files in htmlRoot as apps
+                                   (not secure; don't use on a public facing server)      */
+    //rootScripts:         false,
+
+    /* directoryFunc       Bool.   Whether to provide a directory listing if no index.html is found   */
+    //directoryFunc:       false,
+
+    /* daemon              Bool.   whether to detach from terminal and run as a daemon  */
+    //daemon:              true,
+
+    /* monitor':           Bool.   whether to launch monitor process to auto restart server if
+                                   killed or unrecoverable error */
+    //monitor:             false,
+
+    /* scriptTimeout       Number. Max time to wait for a script module to return a reply in
+                           seconds (default 20). Script callbacks normally should be crafted
+                           to return in a reasonable period of time.  Timeout and reconstruction
+                           of environment is expensive, so this should be a last resort fallback.   */
+    //scriptTimeout:       20,
+
+    /* connectTimeout      Number. Max time to wait for client send request in seconds (default 20)   */
+    //connectTimeout:      20,
+
+    /* quickserver         Bool.   whether to load the alternate quickserver setting which serves
+                                   files from serverRoot only and no apps or wsapps unless
+                                   explicity set                                                    */
+    //quickserver:         false,
+
+    /* serverRoot          String.  base path for logs, htmlRoot, appsRoot and wsappsRoot.
+    //serverRoot:          rampart.utils.realPath('.'),  Note: here ere serverRoot is defined below
+
+    /* map                 Object.  Define filesystem and script mappings, set from htmlRoot,
+                           appsRoot and wsappsRoot above.                                         */
+    /*map:                 {
+                               "/":                working_directory + '/html',
+                               "/apps/":           {modulePath: working_directory + '/apps'},
+                               "ws://wsapps/":     {modulePath: working_directory + '/wsapps'}
+                           }
+                           // note: if this is changed, serverConf.htmlRoot defaults et al will not be used or correct.
+    */
+
+    /* appendMap           Object.  Append the default map above with more mappings
+                           e.g - {"/images": working_directory + '/images'}
+                           or  - {"myfunc.html" : function(req) { ...} }
+                           or  - {
+                                     "/images": working_directory + '/images',
+                                     myfunc.html: {module: working_directory + '/myfuncmod.js'}
+                                 }                                                                 */
+    //appendMap:           undefined,
+
+    /* appendProcTitle     Bool.  Whether to append ip:port to process name as seen in ps */
+    //appendProcTitle:     false,
+
+    /* beginFunc           Bool/Obj/Function.  A function to run at the beginning of each JavaScript
+                           function or on file load
+                           e.g. -
+       beginFunc:          {module: working_directory+'/apps/beginfunc.js'}, //where beginfunc.js is "modules.exports=function(req) {...}"
+       or
+       beginFunc:          myglobalbeginfunc,
+       or
+       beginFunc:          function(req) { ... }
+       or
+       beginFunc:          undefined|false|null  // begin function disabled
+
+                           The function, like all server callback function takes
+                           req, which if altered will be reflected in the call
+                           of the normal callback for the requested page.
+                           Returning false will skip the normal callback and
+                           send a 404 Not Found page.  Returning an object (ie
+                           {html:myhtml}) will skip the normal callback and send
+                           that content.
+
+                           For "file" `req.fsPath` will be set to the file being
+                           retrieved.  If `req.fsPath` is set to a new path and
+                           the function returns true, the updated file will be
+                           sent instead.
+
+                           For websocket connections, it is run only befor the
+                           first connect (when req.count == 0)                    */
+    //beginFunc:           false,
+
+    /* beginFuncOnFile     Whether to run the begin function before serving a
+                           file (-i.e. files from the web_server/html/ directory)  */
+    //beginFuncOnFile:     false,
+
+    /* endFunc             Bool/Obj/Function.  A function to run after each JavaScript function
+
+                           Value (i.e. {module: mymod}) is the same as beginFunc above.
+
+                           It will also receive the `req` object.  In addition,
+                           `req.reply` will be set to the return value of the
+                           normal server callback function and req.reply can be
+                           modified before it is sent.
+
+                           For websocket connections, it is run after websockets
+                           disconnects and after the req.wsOnDisconnect
+                           callback, if any.  `req.reply` is an empty object,
+                           modifying it has no effect and return value from
+                           endFunc has not effect.
+
+                           End function is never run on file requests.                     */
+    //endfunc:             false,
+
+    /* logFunc             Function - a function to replace normal logging, if log:true set above
+                           See two examples below.
+                           -e.g.
+                           logFunc: myloggingfunc,                                                 */
+    //logFunc:             false,
+
+    /* maxBodySize         Number (default 52428800; 50mb) max size of body for any request  */
+    //maxBodySize:         52428800,
+
+    /* defaultRangeMBytes  Number (range 0.01 to 1000) default range size for a "range: x-"
+                           open ended request in megabytes (often used to seek into and chunk videos) */
+    //defaultRangeMbytes:  8,
+    serverRoot:            working_directory,
 }
 
-/* the array holding the ip:port combos we will bind to */
-var bind = [];
+// if not forking, run the langtools init here.
+// otherwise it is run automatically after fork.
+if(serverConf.daemon === false)
+    init_langtools();
 
-if(serverConf.ipAddr && serverConf.ipPort)
-    bind.push(`${serverConf.ipAddr}:${serverConf.ipPort}`);
+/*  Example logging functions :
+    logdata: an object of various individual logging datum
+    logline: the line which would have been written but for logFunc being set
 
-if(serverConf.ipv6Addr && serverConf.ipv6Port)
-    bind.push(`${serverConf.ipv6Addr}:${serverConf.ipv6Port}`);
-    
-if(!bind.length)
-    throw("No ip addr/port specified");
-
-/* 
-   here, we are either "root" (necessary if binding to port 80)
-   or we are an unprivileged user (e.g - "nobody")
-*/
-var iam = trim(exec('whoami').stdout);
-
-/* 
-   Throw an error if we attempt to bind to port <1024 as something
-   other than root.
-*/
-if(iam != "root") {
-    if(serverConf.ipPort < 1024)
-        throw("Error: script must be started as root to bind to IP port " + serverConf.ipPort);
-    if(serverConf.ipv6Port < 1024)
-        throw("Error: script must be started as root to bind to IPv6 port " + serverConf.ipv6Port);
+// example logging func - log output abbreviated if not 200
+function myloggingfunc (logdata, logline) {
+    if(logdata.code != 200)
+        rampart.utils.fprintf(rampart.utils.accessLog,
+            '%s %s "%s %s%s%s %d"\n',
+            logdata.addr, logdata.dateStr, logdata.method,
+            logdata.path, logdata.query?"?":"", logdata.query,
+            logdata.code );
+    else
+        rampart.utils.fprintf(rampart.utils.accessLog,
+            "%s\n", logline);
 }
 
-/*** custom 404 page ***/
-function notfound(req){
-    return {
-        status:404,
-        html: `<html><head><title>404 Not Found</title></head>
-                <body>
-                    <center>
-                        <h1>Not Found</h1>
-                        <p>
-                            The requested URL${%H:req.path.path}
-                            was not found on this server.
-                        </p>
-                        <p><img style="width:65%" src="/images/inigo-not-found.jpg"></p>
-                    </center>
-                </body></html>`
-    }
+// example logging func - skip logging for connections from localhost
+function myloggingfunc_alt (logdata, logline) {
+    if(logdata.addr=="127.0.0.1" || logdata.addr=="::1")
+        return;
+    rampart.utils.fprintf(rampart.utils.accessLog,
+        "%s\n", logline);
 }
-
-/* The dirlist function below is the same as the internal one and is
-   provided so that you can make alterations to the default.
-
-   The choice between no dir list vs internal vs this script is 
-   set below in: 
-       server.start({
-           ...,
-           directoryFunc:[true|false|function]
-       });
-
-   If the standard directory listing is sufficient for your
-   needs, you can delete this function and change 
-   {directoryFunc: true} below
-
-   In this script, the function is unused as directoryFunc is not set
-   below but could be set to this script by setting the following key:value
-   pair in server.start({}) below:
-
-     directoryFunc: dirlist,
-   
-   See directoryFunc setting below.
-
-*/
-
-function dirlist(req) {
-    var html="<!DOCTYPE html>\n"+
-        '<html><head><meta charset="UTF-8"><title>Index of ' + 
-        req.path.path+ 
-        "</title><style>td{padding-right:22px;}</style></head><body><h1>"+
-        req.path.path+
-        '</h1><hr><table>';
-
-    function hsize(size) {
-        var ret=sprintf("%d",size);
-        if(size >= 1073741824)
-            ret=sprintf("%.1fG", size/1073741824);
-        else if (size >= 1048576)
-            ret=sprintf("%.1fM", size/1048576);
-        else if (size >=1024)
-            ret=sprintf("%.1fk", size/1024); 
-        return ret;
-    }
-
-    if(req.path.path != '/')
-        html+= '<tr><td><a href="../">Parent Directory</a></td><td></td><td>-</td></tr>';
-    readdir(req.fsPath).sort().forEach(function(d){
-        var st=stat(req.fsPath+'/'+d);
-        if (st.isDirectory())
-            d+='/';
-        html=sprintf('%s<tr><td><a href="%s">%s</a></td><td>%s</td><td>%s</td></tr>',
-            html, d, d, st.mtime.toLocaleString() ,hsize(st.size));
-    });
-    
-    html+="</table></body></html>";
-    return {html:html};
-}
-
-
-
-
-/****** START SERVER *******/
-printf("Starting https server\n");
-var serverpid=server.start(
-{
-    /* bind: string|[array,of,strings]
-       default: [ "[::1]:8088", "127.0.0.1:8088" ] 
-        ipv6 format: [2001:db8::1111:2222]:80
-        ipv4 format: 127.0.0.1:80
-        spaces are ignored (i.e. " [ 2001:db8::1111:2222 ] : 80" is ok)
-    */
-    /* use the following to bind to all ipv4 and ipv6 addresses */
-    //bind: [ "[::]:8088", "0.0.0.0:8088" ],
-    bind: bind,          // see top of script.
-
-    /* When binding to 80 or 443, must be started as root, 
-       Privileges will be dropped to user:rampart after port is bound.  */
-    user: serverConf.user, //ignored if not root
-
-    /* max time to spend running javascript callbacks */
-    scriptTimeout: 20.0,
-
-    /* how long to wait before client sends a req or server can send a response. 
-       N/A for websockets.                                                        */
-    connectTimeout:20.0, // how long to wait before client sends a req or server can send a response. N/A for websockets.
-
-    /* return javascript errors and "500 internal error"
-       instead of "404 not found" when a JS error is thrown  */
-    developerMode: true,
-
-    /* turn logging on, by default goes to stdout/stderr */
-    //log: true,
-
-    /* access log location, instead of stdout. Must be set if daemon==true && log==true */
-    accessLog: process.scriptPath+"/logs/access.log",
-
-    /* error log location, instead of stderr.  Must be set if daemon==true && log==true */
-    errorLog:  process.scriptPath+"/logs/error.log",
-    
-    /* Fork and run in background. stdin and stderr are closed, 
-       so any logging must go to a file.                          */
-    daemon: true,
-
-    /* if false, override threads below and set threads:1 */
-    //useThreads: false,
-
-    /* e.g for a 4 core, 8 virtual core hyper-threaded processor. Default is the # of system cores. */
-    //threads: 8,
-
-    /* 
-        for https support, these three are needed:
-    */
-    //secure:true,
-    //sslKeyFile:  "/etc/letsencrypt/live/mydom.com/privkey.pem",
-    //sslCertFile: "/etc/letsencrypt/live/mydom.com/fullchain.pem",
-
-    /* sslMinVersion: (ssl3|tls1|tls1.1|tls1.2). "tls1.2" is default*/
-    // sslMinVersion: "tls1.2",
-
-    /* custom 404 page/function defined above */
-    notFoundFunc: notfound, // custom 404 page/function defined above
-
-    /* 
-       adjust/override the default mime mappings.  The defaults can be found at
-       https://rampart.dev/docs/rampart-server.html#key-to-mime-mappings
-    */
-    mimeMap: { "mp3": "audio/mp3" },
-
-    /*
-      use default directory list function. If false/unset, return 404 when there is no index.html. 
-      See above and https://rampart.dev/docs/rampart-server.html#built-in-directory-function
-    */
-    //directoryFunc: true,
-          /* or */
-    //directoryFunc: dirlist,
-          /* or the default */
-    directoryFunc: false,
-          
-    map:
-    {
-        /* static html files location, set above to process.scriptPath + "/html/" */
-        "/":                serverConf.htmlRoot,
-
-        /* 
-           Location of JS scripts for normal GET/POST requests, 
-           set above to process.scriptPath + "/apps/" 
-        */
-        "/apps/":	        {modulePath: serverConf.appsRoot},
-
-        /* 
-           Location of JS scripts for websocket connections,
-           set above to process.scriptPath + "/wsapps/"
-        */
-        "ws://wsapps/":		{modulePath: serverConf.wsappsRoot}
-
-        /************** other mapping examples ************/
-
-        /* 
-           ***  Specifying an Inline Function:  ***
-
-             Inline functions are set once and cannot be edited 
-             while the server is running.
-        */
-        //"/inlinefunc.html":   function(req) {/*produce output here*/},
-
-        /* 
-           ***  Specifying a Global Function:  ***
-
-             The line below assumes a "function myinlinefunc(){ ...}" is
-             declared somewhere in this script.
-
-             Global functions are set once and cannot be edited 
-             while the server is running.
-        */
-        //"/globalfunc.html":   myglobalfunc,
-
-        /* 
-            ***  Matching a Glob to a Function:  ***
-              The example below ("/myscript*") assumes a JS module is
-              located at "modules/mysamplescript.js"
-
-              Notice the '*'.  It will match:
-                http://localhost:8088/myscript/ and
-                http://localhost:8088/myscript/show.html and
-                http://localhost:8088/myscript.html 
-              all match this function
-        */
-        //"/myscript*":          {module: "modules/mysamplescript.js"},
-                        /* or */
-        //"/myscript*":          {module: "modules/mysamplescript"},
-
-        /* 
-            *** Specifying a Function or Functions from a Module:  ***
-
-              There are two ways to specify the location of modules: Using
-                the {module: file} syntax or the {modulePath: path} syntax.
-
-              The former specifies a JavaScript script in single file while
-              the latter specifies a folder/directory that may contain
-              several files.  Any Changes to a file specified in
-              {module: file} or files located in {modulePath: path}
-              while the server is running do not require a server restart,
-              and thus should be the preferred method of url-to-function
-              mapping.
-        */
-
-        /* 
-           *** Module File, single function example:  ***
-
-             A module which returns a single function
-             module.exports=function(){}              
-        */
-        //"/single.html":       {module: "apps/single_function.js"},
-
-        /* 
-           *** Module File, Multiple functions example:  ***
-
-           Below is an example which sets an Object with keys set to URL
-           paths and values set to functions in a hypothetical file named 
-           "modules/multi_function.js":
-
-                module.exports={
-                    "/"                  : indexpage,
-                    "/index.html"        : indexpage,
-                    "/page1.html"        : firstpage,
-                    "/page2.html"        : secondpage,
-                    "/virtdir/page3.html": thirdpage
-                };
-           
-           Where "indexpage", "firstpage", etc are functions in the 
-           "modules/multi_function.js" script.
-
-           This would map respectively to these URLs:
-                    http://localhost:8088/multi/
-                    http://localhost:8088/multi/index.html
-                    http://localhost:8088/multi/page1.html
-                    http://localhost:8088/multi/page2.html
-                    http://localhost:8088/multi/virtdir/page3.html
-
-           And below is how it would be specified in this map object:
-        */
-        //"/multi/":            {module: "apps/multi_function.js" },
-
-    }
-});
-
-/*
-  If daemon:false - server will start at the end of the script when event loop begins.
-  Otherwise the server forks and starts immediately, and var serverpid is the process id
 */
 
-fprintf(process.scriptPath+"/server.pid", "%d", serverpid);
-chown({user:serverConf.user, path:process.scriptPath+"/server.pid"});
 
-sleep(0.5); //wait half a sec, so messages from forked server can print first in the case that logging is turned off.
-
-if(!kill(serverpid, 0)) {
-    printf("Failed to start webserver\n");
-    process.exit(1);
-}
-
-printf(`Server has been started. ${message}
-Server pid is ${serverpid}.  To stop server use kill as such:
-   kill ${serverpid}
-`);
+/* **************************************************** *
+ *  process command line options and start/stop server  *
+ * **************************************************** */
+require("rampart-webserver").web_server_conf(serverConf);

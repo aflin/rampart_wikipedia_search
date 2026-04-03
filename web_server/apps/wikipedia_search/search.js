@@ -165,6 +165,7 @@ function missingdb(lc) {
 <html><head><title>Missing Database</title><meta charset="utf-8"></head><body>
 <h3>The database with code "${lc}" ${langdata[lc]? ( '('+langdata[lc].english+' / '+langdata[lc].native+')' ) : ''} could not be found</h3>
 ${langdata[lc]?'<br><span>Try running <code style="color:green">make_wiki_search</code> from the main distribution directory and enter <code style="color:green">'+lc+'</code> when prompted for a language code':''}
+<p>If already built, check permissions.</p>
 </body></html>
 `};
 }
