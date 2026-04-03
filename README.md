@@ -1,4 +1,6 @@
-# rampart_wikipedia_search A demo full text search of Wikipedia (in one or
+# rampart_wikipedia_search 
+
+A demo full text search of Wikipedia (in one or
 several languages of your choice) using the Rampart SQL module on Linux or
 MacOs.  The search is powerful and efficient enough to be run on hardware as
 small as a Raspberry Pi Zero.
