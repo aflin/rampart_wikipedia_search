@@ -300,24 +300,52 @@ for (var i = 0; i < numThreads; i++) {
 /* Polling fallback: if onGet doesn't fire, poll progress directly */
 var pollInterval = setInterval(function() {
     if (threadsFinished >= numThreads) {
+        /* All worker callbacks have fired — but verify all progress
+           reports show done before exiting.  A thread's callback fires
+           when its JS function returns, so by this point all work is
+           complete.  Read final progress and display. */
         clearInterval(pollInterval);
-        /* Read final progress */
         var finalCount = 0;
+        var finalLines = [];
+        var thrWidth = String(numThreads - 1).length;
+        var countWidth = String(progressData[0].total).length;
         for (var i = 0; i < numThreads; i++) {
             var p = rampart.thread.get("progress_" + i);
-            if (p) finalCount += p.count;
+            if (p) { progressData[i] = p; finalCount += p.count; }
+            else finalCount += progressData[i].count;
+            var pd = progressData[i];
+            finalLines.push(sprintf("  Thread %*d: %*d / %d (%5.1f%%) | %4.0f/sec DONE",
+                thrWidth, i, countWidth, pd.count, pd.total, pd.count/pd.total*100,
+                pd.rate || 0));
         }
         var elapsed = (performance.now() - startTime) / 1000;
-        printf("\n\n  Done: %d articles imported in %s (%.0f/sec across %d threads)\n",
-            finalCount, formatTime(elapsed), finalCount / elapsed, numThreads);
+        finalLines.push("");
+        finalLines.push(sprintf("  TOTAL: %*d / %d (%.1f%%) | %.0f/sec | %s elapsed",
+            countWidth, finalCount, totalArticles,
+            totalArticles > 0 ? finalCount / totalArticles * 100 : 0,
+            finalCount / elapsed, formatTime(elapsed)));
+        printf("%M", finalLines);
+        if (finalCount < totalArticles) {
+            printf("\n\n  Done: %d of %d articles imported in %s (%.0f/sec across %d threads)\n",
+                finalCount, totalArticles, formatTime(elapsed), finalCount / elapsed, numThreads);
+            printf("  %d articles could not be processed (%.1f%% — complex templates or errors)\n",
+                totalArticles - finalCount, (totalArticles - finalCount) / totalArticles * 100);
+        } else {
+            printf("\n\n  Done: %d articles imported in %s (%.0f/sec across %d threads)\n",
+                finalCount, formatTime(elapsed), finalCount / elapsed, numThreads);
+        }
         for (var i = 0; i < numThreads; i++) threads[i].close();
         return;
     }
 
     /* Read progress from clipboard directly */
     var lines = [];
-    var totalCount = 0, totalTotal = 0, totalRate = 0;
+    var totalCount = 0, totalTotal = 0;
+    var maxEtaSeconds = 0; /* track the longest remaining time */
 
+    /* Calculate column widths based on data */
+    var thrWidth = String(numThreads - 1).length;
+    var countWidth = String(progressData[0].total).length;
 
     for (var i = 0; i < numThreads; i++) {
         var p = rampart.thread.get("progress_" + i);
@@ -325,23 +353,29 @@ var pollInterval = setInterval(function() {
         var pd = progressData[i];
         totalCount += pd.count;
         totalTotal += pd.total;
-        totalRate += (pd.rate || 0);
-        var eta = (pd.rate > 0 && pd.pct < 100)
-            ? "  ETA: " + formatTime((pd.total - pd.count) / pd.rate)
-            : "";
+
+        var eta = "";
+        if (pd.rate > 0 && pd.pct < 100) {
+            var secs = (pd.total - pd.count) / pd.rate;
+            eta = "  ETA: " + formatTime(secs);
+            if (secs > maxEtaSeconds) maxEtaSeconds = secs;
+        }
         var status = pd.done ? " DONE" : "";
-        lines.push(sprintf("  Thread %d: %5d / %d (%5.1f%%) | %3.0f/sec%s%s",
-            i, pd.count, pd.total, pd.pct, pd.rate || 0, eta, status));
+        lines.push(sprintf("  Thread %*d: %*d / %d (%5.1f%%) | %4.0f/sec%s%s",
+            thrWidth, i, countWidth, pd.count, pd.total, pd.pct,
+            pd.rate || 0, eta, status));
     }
 
+    /* Overall ETA: use the longest remaining thread, not the average.
+       When most threads are done, the bottleneck is the slowest one. */
     var overallElapsed = (performance.now() - startTime) / 1000;
     var overallRate = overallElapsed > 0 ? totalCount / overallElapsed : 0;
-    var overallEta = overallRate > 0
-        ? formatTime((totalTotal - totalCount) / overallRate)
-        : "starting...";
+    var overallEta = maxEtaSeconds > 0
+        ? formatTime(maxEtaSeconds)
+        : (overallRate > 0 ? formatTime((totalTotal - totalCount) / overallRate) : "starting...");
     lines.push("");
-    lines.push(sprintf("  TOTAL: %d / %d (%.1f%%) | %.0f/sec | %s elapsed | ETA: %s",
-        totalCount, totalTotal,
+    lines.push(sprintf("  TOTAL: %*d / %d (%.1f%%) | %.0f/sec | %s elapsed | ETA: %s",
+        countWidth, totalCount, totalTotal,
         totalTotal > 0 ? totalCount / totalTotal * 100 : 0,
         overallRate, formatTime(overallElapsed), overallEta));
 
