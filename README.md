@@ -35,8 +35,8 @@ After building with ``./make_wiki-search.sh``:
 2. Run ``rampart build-wikivecs.js``
 3. Download a reranker such as [bge-reranker-v2-m3-q8_0.gguf](https://huggingface.co/klnstpr/bge-reranker-v2-m3-Q8_0-GGUF/tree/main)
   Or if limited to a small cpu setup and reranking proves too slow, edit
-  web_server/web_server_start.js and
-  web_server/apps/wikipedia_search/vecsearch.js to remove the reranking
+  ``web_server/web_server_start.js`` and
+  ``web_server/apps/wikipedia_search/vecsearch.js`` to remove the reranking
   step.  The reranking step mostly helps to bring more relevant results to
   the top (i.e.  it pulls the ``"Kill Bill: Volume 1"`` paragraph mentioning
   David Carradine and a paragraph from the ``"David Carradine"`` page to the top
