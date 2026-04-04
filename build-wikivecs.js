@@ -64,7 +64,12 @@ function buildVecs() {
     printf("Model: %s\n", modelFile);
 
     var emb = llamacpp.initEmbed(modelFile);
-    printf("%s\n", llamacpp.getLog());
+    //printf("%s\n", llamacpp.getLog());
+
+    if(!sql.one("select * from SYSINDEX where NAME='wikitext_Id_x'")) {
+        printf("Creating index on wikitext(Id)\n");
+        sql.exec("create index wikitext_Id_x on wikitext(Id) WITH indexmeter 'on'");
+    }
 
     var res = sql.one("select count(Id) cnt from wikitext");
     var totalDocs = res.cnt;
