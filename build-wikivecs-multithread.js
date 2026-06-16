@@ -1,11 +1,14 @@
 /*
-   build-wikivecs-multithread.js — Multi-threaded Phase 1: split + embed + insert.
+   build-wikivecs-multithread.js — multi-threaded semantic build.
 
-   Splits the wikitext table across N threads, each with its own
-   embedding model instance and SQL connection.
+   Phase 1 (parallel): split each wikitext article into chunks and embed them
+   into the wikivecs table, divided across N worker threads (each with its own
+   rampart-sql connection using the embed() SQL function).
+   Phase 2: build the likep + likev search indexes (via mkvecsindex.js).
 
-   After this completes, run build-wikivecs.js to do the FAISS build
-   (it will detect the populated wikivecs table and skip to Phase 2).
+   Threads default to min(cpu count, 10) — embedding is GPU-bound, so a handful
+   of workers already saturate the GPU and more give diminishing returns.
+   Override with the optional num_threads argument.
 
    Usage:  rampart build-wikivecs-multithread.js [lang_code] [num_threads]
 */
@@ -15,19 +18,40 @@ var thread = rampart.thread;
 
 rampart.globalize(rampart.utils);
 
-var nCpu = parseInt(process.argv[3]) || process.nCpu || 4;
+// Cap worker threads at 10: embedding is GPU-bound, so a handful of workers
+// already saturate the GPU and more just add CPU contention for little gain.
+// An explicit num_threads argument overrides the cap.
+var nCpu = parseInt(process.argv[3]) || Math.min(process.nCpu || 4, 10);
+
 var lc = "en";
 if (process.argv.length > 2 && process.argv[2].length)
     lc = process.argv[2];
 
 var dbPath = process.scriptPath + "/web_server/data/" + lc + "_wikipedia_search";
-var modelFile = "all-minilm-l6-v2_f16.gguf";
-var vecDim = 384;
 
-if (!stat(modelFile)) {
-    fprintf(stderr, "Model '%s' not found. Download it first.\n", modelFile);
+// embedding model: English/Simple use the small English MiniLM; every other
+// language uses multilingual bge-m3. Ensured in ~/.rampart/models/embed/ and
+// symlinked into web_server/data/models/. The big multilingual model offers to
+// download (prompts) when absent; MiniLM just fetches.
+var getmodel  = require(process.scriptPath + "/getmodel.js");
+var embedSpec = getmodel.embedModelFor(lc);
+var modelFile = getmodel.ensureModel("embed", embedSpec.name, embedSpec.url,
+    process.scriptPath + "/web_server/data/models",
+    { confirm: getmodel.confirmEmbedDownload(lc) });
+if (!modelFile) {
+    printf("No embedding model -- cannot build the semantic index for '%s'. Aborting.\n", lc);
     process.exit(1);
 }
+
+// Vector dimension is read from the model itself via modelInfo() -- a weights-free
+// vocab_only load -- so swapping the embed model above needs no other change here.
+function loadLlamacpp() {
+    var names = ["rampart-llamacpp", "rampart-llamacpp_cuda", "rampart-llamacpp_cpu"];
+    for (var i = 0; i < names.length; i++) { try { return require(names[i]); } catch(e) {} }
+    throw new Error("could not load rampart-llamacpp");
+}
+var minfo  = loadLlamacpp().modelInfo(modelFile);
+var vecDim = minfo.embedDim;
 
 function formatTime(seconds) {
     if (seconds < 60) return seconds.toFixed(0) + "s";
@@ -46,6 +70,7 @@ function formatTime(seconds) {
 printf("build-wikivecs-multithread.js\n");
 printf("Database: %s\n", dbPath);
 printf("Model: %s\n", modelFile);
+printf("  dim=%d  ctx=%d  arch=%s  pooling=%s\n", vecDim, minfo.nCtxTrain, minfo.arch, minfo.pooling);
 printf("Started: %s\n\n", dateFmt('%c %z'));
 
 var sql = new Sql.init(dbPath, true);
@@ -79,7 +104,9 @@ if (!sql.one("select * from SYSTABLES where NAME='wikivecs'")) {
             sql.query("drop table wikivecs");
             sql.query("create table wikivecs (Idsec uint64, Vec varbyte(" + vecDim + "), Title varchar(16), Text varchar(256))");
         } else {
-            printf("Exiting. Run build-wikivecs.js to proceed to FAISS build.\n");
+            printf("Keeping existing wikivecs; building search indexes only.\n");
+            sql.close();
+            require(process.scriptPath + "/mkvecsindex.js");
             process.exit(0);
         }
     }
@@ -111,6 +138,17 @@ var g_modelFile = modelFile;
 var g_vecDim = vecDim;
 var g_splitterPath = process.scriptPath + "/wikiparser/splitter.js";
 
+/* Load the embed MODEL once here in main, before any worker starts. The handle
+ * is process-global and refcounted by path, but rp_embed_load does
+ * check-then-create with the cache lock released in between -- so if all N
+ * workers raced to load it at once they could each build a separate model copy
+ * (extra GPU weight copies -> faster OOM). Loading once here populates the cache
+ * so every worker's sql.set is a cache hit and they share the weights, each
+ * adding only its own per-thread context. */
+printf("Loading embed model...\n");
+sql.set({llamaEmbed: g_modelFile, llamaEmbedPerThread: true});
+
+
 var threads = [];
 for (var i = 0; i < numThreads; i++) {
     threads.push(new thread(true));
@@ -123,17 +161,25 @@ var threadsFinished = 0;
    Worker function — runs in each thread.
    Each thread loads its own embedding model, SQL connection, and splitter.
 */
+
 function workerFunc(arg) {
     rampart.globalize(rampart.utils);
-
     var Sql = require("rampart-sql");
-    var llamacpp = require("rampart-llamacpp");
+    //var llamacpp = require("rampart-llamacpp");
+
+    var sql = new Sql.init(g_dbPath, false);
+    /* Per-thread embed context: each worker gets its own llama_context for real
+     * parallelism (mutex-serializing on one shared context is ~4x slower). The
+     * model itself is already loaded in main (shared + refcounted), so this is a
+     * cache hit on the weights plus a new per-thread context. The worker count is
+     * user-selectable (make-wiki-search.sh prompt / argv[3]); a handful of threads
+     * already saturate the GPU, so the default caps at 10 -- more just adds CPU
+     * contention for little gain. */
+    sql.set({llamaEmbed: g_modelFile, llamaEmbedPerThread: true});
+
     var splitter = require(g_splitterPath);
 
     var myId = arg.id;
-    var sql = new Sql.init(g_dbPath, false);
-    var emb = llamacpp.initEmbed(g_modelFile);
-
     var myCount = 0, myChunks = 0, mySkipped = 0;
     var emaRate = 0, lastCount = 0, lastTime = 0;
     var myStartTime = performance.now();
@@ -152,9 +198,9 @@ function workerFunc(arg) {
                 myCount++;
             } else {
                 for (var i = 0; i < parts.length; i++) {
-                    var x = emb.embedTextToFp16Buf(parts[i].text);
-                    sql.one("insert into wikivecs values(?,?,?,?)",
-                        [parts[i].idSec, x.avgVec, row.Title, parts[i].text]);
+                    //var x = emb.embedTextToFp16Buf(parts[i].text);
+                    sql.one("insert into wikivecs values(?,embed(?),?,?)",
+                        [parts[i].idSec, parts[i].text, row.Title, parts[i].text]);
                     myChunks++;
                 }
                 myCount++;
@@ -259,9 +305,13 @@ var pollInterval = setInterval(function() {
         printf("Avg %.1f chunks/doc, %d skipped (%.1f%%)\n",
             totalChunks / totalDocs, totalSkipped, totalSkipped / totalDocs * 100);
         printf("Finished: %s\n\n", dateFmt('%c %z'));
-        printf("Now run: rampart build-wikivecs.js %s\n", lc);
 
         for (var i = 0; i < numThreads; i++) threads[i].close();
+
+        // Phase 2: build the likep + likev search indexes (mkvecsindex.js)
+        sql.close();
+        printf("=== Building search indexes (mkvecsindex.js) ===\n");
+        require(process.scriptPath + "/mkvecsindex.js");
         return;
     }
 

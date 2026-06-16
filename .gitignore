@@ -1,0 +1,7 @@
+web_server/data/
+web_server/server.pid
+web_server/logs/
+*wiki_index/
+*pages-articles.xml*
+wikiparser/wikiDumpScanner.*
+wikiparser/wikiTemplateExpander.*

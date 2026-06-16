@@ -24,50 +24,37 @@ var working_directory = process.scriptPath;
 
 /* ***********************  SEMANTIC SEARCH ADDITIONS ********************** */
 
-// these should be in the main director below this one (web_server/..)
-var faiss_index_name  = "wikivecs-minilm.OPQ48_IVF16384_PQ48_faiss.complete";
+// Models live in the standard store ~/.rampart/models/<embed|rerank>/ and are
+// symlinked into web_server/data/models/ (downloaded on first use if missing).
 var llama_model_name = "all-minilm-l6-v2_f16.gguf";
 var llama_rankr_name = "bge-reranker-v2-m3-Q8_0.gguf";
+var llama_model_url  = "https://huggingface.co/LLukas22/all-MiniLM-L6-v2-GGUF/resolve/main/all-minilm-l6-v2_f16.gguf";
+var llama_rankr_url  = "https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q8_0.gguf";
 
-var faiss_index = false;
 var llama_model = false;
 var llama_rankr = false;
+var Sql = require('rampart-sql');
+var getmodel = require(working_directory + "/../getmodel.js");
 
-try {
-    faiss_index = rampart.utils.realPath(working_directory + "/../" + faiss_index_name);
-    llama_model = rampart.utils.realPath(working_directory + "/../" + llama_model_name);
-    llama_rankr = rampart.utils.realPath(working_directory + "/../" + llama_rankr_name);
-} catch(e){}
-
-// cuda does not work with forking, so we need to load after fork
+// cuda does not work with forking, so we need to load llamacpp models after fork
 function init_langtools() {
     rampart.localize(rampart.utils);
     var g=global;
 
-    if(!stat(working_directory + 'data/en_wikipedia_search/wikivecs.tbl')) {
-        fprintf(stderr, "data/en_wikipedia_search/wikivecs.tbl not found.  Semantic search disabled\n", faiss_index_name);
+/*
+    if(!stat(working_directory + '/data/en_wikipedia_search/wikivecs.tbl')) {
+        fprintf(stderr, "data/en_wikipedia_search/wikivecs.tbl not found (or permission problem).  Semantic search disabled\n");
         return;
     }
-
-    if(!faiss_index) {
-        fprintf(stderr, "faiss index '%s' not found.  Semantic search disabled\n", faiss_index_name);
-        return;
-    }
-
-    if(!llama_model) {
-        fprintf(stderr, "llama model '%s' not found.  Semantic search disabled\n", llama_model_name);
-        return;
-    }
-
-    if(!llama_rankr) {
-        fprintf(stderr, "llama rerank model '%s' not found.  Semantic search disabled\n", llama_rankr_name);
-        return;
-    }
-
+*/
+    // ensure the embed + rerank models are available (use web_server/data/models/
+    // if present, else download to ~/.rampart/models/<cat>/ and symlink there)
+    var modelsDir = working_directory + "/data/models";
     try {
-        g.faiss = require('rampart-faiss');
+        llama_model = getmodel.ensureModel("embed",  llama_model_name, llama_model_url, modelsDir);
+        llama_rankr = getmodel.ensureModel("rerank", llama_rankr_name, llama_rankr_url, modelsDir);
     } catch(e) {
-        fprintf(stderr, "rampart-faiss module not found.  Semantic search disabled\n");
+        fprintf(stderr, "could not obtain semantic-search models: %s.  Semantic search disabled\n", e.message || e);
         return;
     }
 
@@ -77,14 +64,15 @@ function init_langtools() {
         fprintf(stderr, "rampart-llamacpp module not found.  Semantic search disabled\n");
         return;
     }
-
+/*
     try {
-        g.llama_emb = llamacpp.initEmbed(llama_model);
+        g.sql = Sql.connect(working_directory + '/data/en_wikipedia_search/');
+        g.sql.set({llamaEmbed: llama_model});
     } catch(e) {
-        fprintf(stderr, "rampart-llamacpp module failed to load '%s'\n%s\n\n   Log:\n%s\n", llama_model, e.message, llamacpp.getLog());
+        fprintf(stderr, "rampart-sql module failed to load '%s' or failed to connect to db\n%s\n\n   Log:\n%s\n", llama_model, e.message, llamacpp.getLog());
         process.exit(1);
     }
-
+*/
     try {
         llamacpp.resetLog();
         g.llama_rr = llamacpp.initRerank(llama_rankr,{ubatch:256});
@@ -93,14 +81,6 @@ function init_langtools() {
         process.exit(1);
     }
 
-    try {
-        g.faiss_wiki_idx = faiss.openIndexFromFile(faiss_index);
-    } catch(e) {
-        fprintf(stderr, "rampart-faiss module failed to load '%s'\n%s\n", faiss_index, e.message);
-        process.exit(1);
-    }
-
-    printf("faiss index '%s' loaded\nllama model '%s' loaded\n", faiss_index_name, llama_model_name);
 }
 
 
@@ -115,6 +95,9 @@ function init_langtools() {
 var serverConf = {
 
     postForkFunc: init_langtools,
+    bindAll: true,
+    port: 8087,
+    daemon: true,
 
     //the defaults for full server
 

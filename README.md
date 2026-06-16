@@ -39,7 +39,10 @@ After building with ``./make_wiki-search.sh``:
 1. Download a embeddings model like [all-MiniLM-L6-v2-GGUF](https://huggingface.co/LLukas22/all-MiniLM-L6-v2-GGUF/tree/main)
   (384 dim; English; default in the script) or 
   [bge-m3-FP16.gguf](https://huggingface.co/gpustack/bge-m3-GGUF/tree/main) (1024 dim; multi-lingual).
-2. Run ``rampart build-wikivecs.js``
+2. Run ``rampart build-wikivecs.js`` — this splits articles into chunks, embeds
+  them into the ``wikivecs`` table, then builds the ``likep`` (full-text) and
+  ``likev`` (vector) search indexes (via ``mkvecsindex.js``, which can also be
+  run on its own to (re)build just the indexes).
 3. Download a reranker such as [bge-reranker-v2-m3-q8_0.gguf](https://huggingface.co/klnstpr/bge-reranker-v2-m3-Q8_0-GGUF/tree/main)
   Or if limited to a small cpu setup and reranking proves too slow, edit
   ``web_server/web_server_start.js`` and

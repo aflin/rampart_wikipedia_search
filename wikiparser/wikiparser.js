@@ -299,14 +299,42 @@ var expandExportFunc = `
 
 var scanWikiDump, wikiExpandC;
 
+/* Build mode for the embedded C modules. Default is the optimized -O3 build.
+ * For debugging a crash in the expander, set one of these env vars before
+ * running (changing the flags forces a recompile automatically):
+ *
+ *   WIKIPARSER_DEBUG=1   -> -O0 -g           (exact gdb line numbers/values;
+ *                                             no "optimized out" — start here)
+ *   WIKIPARSER_ASAN=1    -> -O0 -g + AddressSanitizer (pinpoints the bad read,
+ *                                             the buffer, and where it was made)
+ *
+ * ASAN note: the .so is loaded into a non-ASAN rampart, so run with the ASAN
+ * runtime preloaded, e.g.:
+ *     ASAN_OPTIONS=verify_asan_link_order=0 \
+ *     LD_PRELOAD="$(cc -print-file-name=libasan.so)" rampart import-multithread.js simple
+ */
+var _dbg = process.env.WIKIPARSER_ASAN  ? "-O0 -g -fsanitize=address -fno-omit-frame-pointer"
+         : process.env.WIKIPARSER_DEBUG ? "-O0 -g"
+         : "-O3";
+/* -D_GNU_SOURCE: expose memmem()'s real (void*) prototype. Without it, under
+ *   -std=c99 on glibc/Linux memmem is undeclared -> implicitly int -> its 64-bit
+ *   return is truncated to 32 bits, so a pointer assigned from it (e.g. _sq in the
+ *   style="" scrub) is garbage and derefs crash. (macOS declares it regardless,
+ *   which is why this only segfaulted on Linux.)
+ * -Werror=implicit-function-declaration: make that whole bug class a hard build
+ *   error instead of a silently-truncating warning. */
+var _gnu = " -D_GNU_SOURCE -Werror=implicit-function-declaration";
+var scanFlags   = _dbg + _gnu;
+var expandFlags = _dbg + " -std=c99" + _gnu;
+
 try {
-    scanWikiDump = cmodule("wikiDumpScanner", scanExportFunc, scanSupportFuncs, "-O3");
+    scanWikiDump = cmodule("wikiDumpScanner", scanExportFunc, scanSupportFuncs, scanFlags);
 } catch(e) {
     throw new Error("wikiparser: failed to compile scanner: " + (e.message || e));
 }
 
 try {
-    wikiExpandC = cmodule("wikiTemplateExpander", expandExportFunc, expandSupportCode, "-O3 -std=c99", "-lm");
+    wikiExpandC = cmodule("wikiTemplateExpander", expandExportFunc, expandSupportCode, expandFlags, "-lm");
 } catch(e) {
     throw new Error("wikiparser: failed to compile expansion engine: " + (e.message || e));
 }
