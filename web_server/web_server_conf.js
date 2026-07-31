@@ -2,9 +2,9 @@
 
 /*
 the server can be started by running:
-  rampart web_server_config.js
+  rampart web_server_conf.js
          or
-  rampart web_server_config.js start
+  rampart web_server_conf.js start
 
 Help:
   ./web_server_conf.js help
@@ -24,66 +24,38 @@ var working_directory = process.scriptPath;
 
 /* ***********************  SEMANTIC SEARCH ADDITIONS ********************** */
 
-// Models live in the standard store ~/.rampart/models/<embed|rerank>/ and are
-// symlinked into web_server/data/models/ (downloaded on first use if missing).
-var llama_model_name = "all-minilm-l6-v2_f16.gguf";
-var llama_rankr_name = "bge-reranker-v2-m3-Q8_0.gguf";
-var llama_model_url  = "https://huggingface.co/LLukas22/all-MiniLM-L6-v2-GGUF/resolve/main/all-minilm-l6-v2_f16.gguf";
-var llama_rankr_url  = "https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q8_0.gguf";
+/* The fused search (vecsearch.js) needs two things beyond the database:
 
-var llama_model = false;
-var llama_rankr = false;
-var Sql = require('rampart-sql');
-var getmodel = require(working_directory + "/../getmodel.js");
+   1. QUERY EMBEDDING — per-language, configured by the model.json that
+      build-wikivecs.js wrote into each <lc>_wikipedia_search directory.
+      vecsearch.js handles that itself (one sql connection per language,
+      each set to the model+engine that built its table).
 
-// cuda does not work with forking, so we need to load llamacpp models after fork
+   2. THE RERANKER — one bge-reranker-v2-m3 cross-encoder handle, shared
+      by every server thread.  wikilib resolves it through rampart-models
+      (the ~/.rampart store), the same way the embedding models resolve.
+      Loaded here AFTER the fork (CUDA does not
+      survive forking) and copied to the workers as the global 'rr'.
+      If the model or module is missing, reranking is simply disabled and
+      results keep their fused (likev + likep) order. */
+
+var wikilib = require(working_directory + "/../wikilib.js");
+
 function init_langtools() {
-    rampart.localize(rampart.utils);
-    var g=global;
-
-/*
-    if(!stat(working_directory + '/data/en_wikipedia_search/wikivecs.tbl')) {
-        fprintf(stderr, "data/en_wikipedia_search/wikivecs.tbl not found (or permission problem).  Semantic search disabled\n");
-        return;
+    var g = global;
+    /* only load the reranker when a fused database exists */
+    var data = rampart.utils.readDir(working_directory + "/data") || [];
+    var haveVecs = false;
+    for (var i = 0; i < data.length; i++) {
+        if (/_wikipedia_search$/.test(data[i]) &&
+            rampart.utils.stat(working_directory + "/data/" + data[i] + "/wikivecs.tbl")) {
+            haveVecs = true;
+            break;
+        }
     }
-*/
-    // ensure the embed + rerank models are available (use web_server/data/models/
-    // if present, else download to ~/.rampart/models/<cat>/ and symlink there)
-    var modelsDir = working_directory + "/data/models";
-    try {
-        llama_model = getmodel.ensureModel("embed",  llama_model_name, llama_model_url, modelsDir);
-        llama_rankr = getmodel.ensureModel("rerank", llama_rankr_name, llama_rankr_url, modelsDir);
-    } catch(e) {
-        fprintf(stderr, "could not obtain semantic-search models: %s.  Semantic search disabled\n", e.message || e);
-        return;
-    }
-
-    try {
-        g.llamacpp = require('rampart-llamacpp');
-    } catch(e) {
-        fprintf(stderr, "rampart-llamacpp module not found.  Semantic search disabled\n");
-        return;
-    }
-/*
-    try {
-        g.sql = Sql.connect(working_directory + '/data/en_wikipedia_search/');
-        g.sql.set({llamaEmbed: llama_model});
-    } catch(e) {
-        fprintf(stderr, "rampart-sql module failed to load '%s' or failed to connect to db\n%s\n\n   Log:\n%s\n", llama_model, e.message, llamacpp.getLog());
-        process.exit(1);
-    }
-*/
-    try {
-        llamacpp.resetLog();
-        g.llama_rr = llamacpp.initRerank(llama_rankr,{ubatch:256});
-    } catch(e) {
-        fprintf(stderr, "rampart-llamacpp module failed to load '%s'\n%s\n\n   Log:\n%s\n", llama_rankr, e.message, llamacpp.getLog());
-        process.exit(1);
-    }
-
+    if (!haveVecs) return;
+    g.rr = wikilib.initReranker();
 }
-
-
 
 /* ******************* END  SEMANTIC SEARCH ADDITIONS ********************** */
 
@@ -94,10 +66,7 @@ function init_langtools() {
 
 var serverConf = {
 
-    postForkFunc: init_langtools,
-    bindAll: true,
-    port: 8087,
-    daemon: true,
+    preThreadFunc: init_langtools,
 
     //the defaults for full server
 
@@ -109,15 +78,6 @@ var serverConf = {
 
     /* bindAll             Bool.   Set ipAddr and ipv6Addr to 0.0.0.0 and [::] respectively   */
     //bindAll:             false,
-
-    /* ipPort              Number. Set ipv4 port   */
-    //ipPort:              8088,
-
-    /* ipv6Port            Number. Set ipv6 port   */
-    //ipv6Port:            8088,
-
-    /* port                Number. Set both ipv4 and ipv6 port if > -1   */
-    //port:                -1,
 
     /* htmlRoot            String. Root directory from which to serve files   */
     //htmlRoot:            working_directory + '/html',
@@ -134,19 +94,6 @@ var serverConf = {
     /* logRoot             String. Log directory   */
     //logRoot:             working_directory + '/logs',
 
-    /* irohProxy           Bool.  Whether to start the irohProxy server to proxy http to iroh-webproxy client */
-    //irohProxy:           false,
-
-    /* redirPort           Number. Launch http->https redirect server and set port if < -1  */
-    //redirPort:           -1,
-
-    /* redir               Bool.   Launch http->https redirect server and set to port 80   */
-    //redir:               false,
-
-    /* redirTemp           Bool. If true, and if redir is true or redirPort is set, send a
-                                 302 Moved Temporarily instead of a 301 Moved Permanently   */
-    //redirTemp            false,
-
     /* accessLog           String. Log file name or null for stdout  */
     //accessLog:           working_directory + '/logs/access.log',
 
@@ -155,20 +102,6 @@ var serverConf = {
 
     /* log                 Bool.   Whether to log requests and errors   */
     //log:                 true,
-
-    /* rotateLogs          Bool.   Whether to rotate the logs   */
-    //rotateLogs:          false,
-
-    /* rotateStart         String. Time to start log rotations   */
-    //rotateStart:         '00:00',
-
-    /* rotateInterval      Number. Interval between log rotations in seconds or
-                           String. One of "hourly", "daily" or "weekly"        */
-    //rotateInterval:      86400,
-
-    /* rotateCount         Number. Maximum number of old log files to keep.
-                                   Oldest logs beyond this count are deleted.  */
-    //rotateCount:         30,
 
     /* user                String. If started as root, switch to this user
                                    It is necessary to start as root if using ports < 1024   */
@@ -187,23 +120,12 @@ var serverConf = {
     /* sslCertFile         String. If https, the ssl/tls cert file location   */
     //sslCertFile:         '',
 
-    /* selfSign            Bool.   Whether to generate and use a self signed certificate
-                                   If set, secure must be true and sslKeyFile/sslCertFile/letsencrypt must be unset.
-    //selfSign             false,
-
     /* developerMode       Bool.   Whether JavaScript errors result in 500 and return a stack trace.
                                    Otherwise errors return 404 Not Found                             */
     //developerMode:       true,
 
-    /* letsencrypt         String. If using letsencrypt, the 'domain.tld' name for automatic setup of https
-                                   ( sets secure true and looks for '/etc/letsencrypt/live/domain.tld/' directory
-                                     to set sslKeyFile and sslCertFile ).
-                                   ( also sets "port" to 443 ).                                                      */
-    //letsencrypt:         "",     //empty string - don't configure using letsencrypt
-
-    /* rootScripts         Bool.   Whether to treat *.js files in htmlRoot as apps
-                                   (not secure; don't use on a public facing server)      */
-    //rootScripts:         false,
+    /* letsencrypt         String. If using letsencrypt, the 'domain.tld' name for automatic setup of https   */
+    //letsencrypt:         "",
 
     /* directoryFunc       Bool.   Whether to provide a directory listing if no index.html is found   */
     //directoryFunc:       false,
@@ -211,145 +133,24 @@ var serverConf = {
     /* daemon              Bool.   whether to detach from terminal and run as a daemon  */
     //daemon:              true,
 
-    /* monitor':           Bool.   whether to launch monitor process to auto restart server if
+    /* monitor             Bool.   whether to launch monitor process to auto restart server if
                                    killed or unrecoverable error */
     //monitor:             false,
 
-    /* scriptTimeout       Number. Max time to wait for a script module to return a reply in
-                           seconds (default 20). Script callbacks normally should be crafted
-                           to return in a reasonable period of time.  Timeout and reconstruction
-                           of environment is expensive, so this should be a last resort fallback.   */
+    /* scriptTimeout       Number. Max time to wait for a script module to return a reply in seconds (default 20) */
     //scriptTimeout:       20,
 
     /* connectTimeout      Number. Max time to wait for client send request in seconds (default 20)   */
     //connectTimeout:      20,
 
-    /* quickserver         Bool.   whether to load the alternate quickserver setting which serves
-                                   files from serverRoot only and no apps or wsapps unless
-                                   explicity set                                                    */
-    //quickserver:         false,
-
-    /* serverRoot          String.  base path for logs, htmlRoot, appsRoot and wsappsRoot.
-    //serverRoot:          rampart.utils.realPath('.'),  Note: here ere serverRoot is defined below
-
-    /* map                 Object.  Define filesystem and script mappings, set from htmlRoot,
-                           appsRoot and wsappsRoot above.                                         */
-    /*map:                 {
-                               "/":                working_directory + '/html',
-                               "/apps/":           {modulePath: working_directory + '/apps'},
-                               "ws://wsapps/":     {modulePath: working_directory + '/wsapps'}
-                           }
-                           // note: if this is changed, serverConf.htmlRoot defaults et al will not be used or correct.
-    */
-
-    /* appendMap           Object.  Append the default map above with more mappings
-                           e.g - {"/images": working_directory + '/images'}
-                           or  - {"myfunc.html" : function(req) { ...} }
-                           or  - {
-                                     "/images": working_directory + '/images',
-                                     myfunc.html: {module: working_directory + '/myfuncmod.js'}
-                                 }                                                                 */
-    //appendMap:           undefined,
-
-    /* appendProcTitle     Bool.  Whether to append ip:port to process name as seen in ps */
-    //appendProcTitle:     false,
-
-    /* beginFunc           Bool/Obj/Function.  A function to run at the beginning of each JavaScript
-                           function or on file load
-                           e.g. -
-       beginFunc:          {module: working_directory+'/apps/beginfunc.js'}, //where beginfunc.js is "modules.exports=function(req) {...}"
-       or
-       beginFunc:          myglobalbeginfunc,
-       or
-       beginFunc:          function(req) { ... }
-       or
-       beginFunc:          undefined|false|null  // begin function disabled
-
-                           The function, like all server callback function takes
-                           req, which if altered will be reflected in the call
-                           of the normal callback for the requested page.
-                           Returning false will skip the normal callback and
-                           send a 404 Not Found page.  Returning an object (ie
-                           {html:myhtml}) will skip the normal callback and send
-                           that content.
-
-                           For "file" `req.fsPath` will be set to the file being
-                           retrieved.  If `req.fsPath` is set to a new path and
-                           the function returns true, the updated file will be
-                           sent instead.
-
-                           For websocket connections, it is run only befor the
-                           first connect (when req.count == 0)                    */
-    //beginFunc:           false,
-
-    /* beginFuncOnFile     Whether to run the begin function before serving a
-                           file (-i.e. files from the web_server/html/ directory)  */
-    //beginFuncOnFile:     false,
-
-    /* endFunc             Bool/Obj/Function.  A function to run after each JavaScript function
-
-                           Value (i.e. {module: mymod}) is the same as beginFunc above.
-
-                           It will also receive the `req` object.  In addition,
-                           `req.reply` will be set to the return value of the
-                           normal server callback function and req.reply can be
-                           modified before it is sent.
-
-                           For websocket connections, it is run after websockets
-                           disconnects and after the req.wsOnDisconnect
-                           callback, if any.  `req.reply` is an empty object,
-                           modifying it has no effect and return value from
-                           endFunc has not effect.
-
-                           End function is never run on file requests.                     */
-    //endfunc:             false,
-
-    /* logFunc             Function - a function to replace normal logging, if log:true set above
-                           See two examples below.
-                           -e.g.
-                           logFunc: myloggingfunc,                                                 */
-    //logFunc:             false,
-
-    /* maxBodySize         Number (default 52428800; 50mb) max size of body for any request  */
-    //maxBodySize:         52428800,
-
-    /* defaultRangeMBytes  Number (range 0.01 to 1000) default range size for a "range: x-"
-                           open ended request in megabytes (often used to seek into and chunk videos) */
-    //defaultRangeMbytes:  8,
     serverRoot:            working_directory,
 }
 
-// if not forking, run the langtools init here.
-// otherwise it is run automatically after fork.
-if(serverConf.daemon === false)
+// If not forking, run the langtools init here.
+// Otherwise it is run automatically after fork and 
+// privelege drop, and before server threads are created.
+if (serverConf.daemon === false)
     init_langtools();
-
-/*  Example logging functions :
-    logdata: an object of various individual logging datum
-    logline: the line which would have been written but for logFunc being set
-
-// example logging func - log output abbreviated if not 200
-function myloggingfunc (logdata, logline) {
-    if(logdata.code != 200)
-        rampart.utils.fprintf(rampart.utils.accessLog,
-            '%s %s "%s %s%s%s %d"\n',
-            logdata.addr, logdata.dateStr, logdata.method,
-            logdata.path, logdata.query?"?":"", logdata.query,
-            logdata.code );
-    else
-        rampart.utils.fprintf(rampart.utils.accessLog,
-            "%s\n", logline);
-}
-
-// example logging func - skip logging for connections from localhost
-function myloggingfunc_alt (logdata, logline) {
-    if(logdata.addr=="127.0.0.1" || logdata.addr=="::1")
-        return;
-    rampart.utils.fprintf(rampart.utils.accessLog,
-        "%s\n", logline);
-}
-*/
-
 
 /* **************************************************** *
  *  process command line options and start/stop server  *

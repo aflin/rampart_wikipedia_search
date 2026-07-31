@@ -1,29 +1,79 @@
 /*
+vecsearch.js — the fused (vector + keyword) wikipedia search.
+
 This script runs in one of many server threads, each with its own javascript
 interpreter.  Everything outside the exported search function below runs ONCE per
 thread, the first time the module is loaded (so connections/models set up here are
 reused across many requests on that thread).
 
-A wikipedia database for language "xx" lives in data/xx_wikipedia_search, and was
-built with one of two embedding models:
-   * English / Simple English -> all-minilm  (small, English-only, 384 dims)
-   * every other language      -> bge-m3      (multilingual, 1024 dims)
-We must query each database with the SAME model it was built with.  rampart-sql's
-embed() (used by "Vec likev '...text...'") now resolves the model PER sql handle,
-so we just open one connection per language and tell each which model to use.
+It serves the one-table layout built by build-wikivecs.js:
 
-The model weights are loaded only ONCE per process and shared by every thread/
-connection that uses the same model file; only a small per-thread inference
-context is created as needed.
+    wikivecs (Id int, Title varchar, Doc varchar, Vec varvecF16)
+
+where Vec holds ALL of an article's chunk vectors concatenated
+(chunkembed(): k x dim cells) and Doc carries the keyword (metamorph)
+index.  Both halves of the search live on the same row, so the whole
+search is a single statement:
+
+    select $rank score, Id, Title,
+           abstract(Doc, 400, 'querybest', ?, Vec) Snip
+      from wikivecs
+     where Doc likep ? or Vec likev ?
+
+  * likep is the keyword side, likev the vector side.  A string to the
+    right of likep is parsed as a keyword query; a string to the right
+    of likev is embedded by the engine using the same model that built
+    this table -- and that model's query prompt, if it has one.  See
+    getLangSql() below, which sets the model per connection.
+
+  * likev scores an ARTICLE by its best-matching chunk, so there are no
+    chunk rows to collapse afterwards: one row per article, ranked by
+    whichever of its chunks won.
+
+  * Each side ranks its own candidate pool -- likeprows deep for
+    keywords, likevRows deep for vectors -- and the engine fuses the two
+    by Reciprocal Rank Fusion: $rank = sum of 1e6/(60 + position) over
+    the pools a row appears in.  So a row both sides like outranks a row
+    only one side likes, and the result set arrives deduplicated and
+    already in fused-rank order.
+
+  * abstract(Doc, 400, 'querybest', ?, Vec) -- the 5-argument vector
+    form -- seeds the snippet from the text span of the chunk that won.
+    It embeds its own query argument (a cache hit: likev just embedded
+    the same string) and scores the row's chunks, so it also returns a
+    sensible snippet for a row the keyword side found on its own.
+
+Two things worth not "fixing":
+
+  * There is no ORDER BY.  The rows already arrive in fused-rank order,
+    and adding a sort forces every candidate in both pools through the
+    select list before sorting -- hundreds of abstracts computed to
+    display twenty.  Measured 2x slower for identical output.
+
+  * The row count is bounded by maxRows on the exec.  The select list is
+    evaluated lazily, so abstract() runs only for the rows actually
+    returned.
+
+A wikipedia database for language "xx" lives in data/xx_wikipedia_search;
+the embedding model that built it is recorded in its model.json (written
+by build-wikivecs.js).  We must query each database with that exact
+model+engine; the model resolves PER sql handle, so we open one
+connection per language.  Model weights load ONCE per process and are
+shared by every thread/connection naming the same model.
 */
 
 rampart.globalize(rampart.utils);
 
-var Sql = require("rampart-sql");
+/* Cross-encoder reranking of the top results is per-request, controlled by
+   the "Rerank" checkbox in the search form (query parameter `rr').  Off by
+   default -- an unchecked box submits nothing, so a first load and a
+   cleared box are the same state -- which shows results in the engine's
+   fused (RRF) order, untouched: the useful view for judging retrieval
+   itself.  Each request reads it into `useRerank' in searchvec(). */
+var RERANK_PARAM = "rr";
 
-// embedding models live (symlinked by the build scripts) in data/models/
-var minilm = serverConf.dataRoot + "/models/all-minilm-l6-v2_f16.gguf";
-var bgem3  = serverConf.dataRoot + "/models/bge-m3-Q8_0.gguf";
+var Sql = require("rampart-sql");
+var wikilib = require(serverConf.serverRoot + "/../wikilib.js");
 
 // one sql connection per language, created on first use and cached for this thread
 var sqlByLang = {};
@@ -34,19 +84,43 @@ function getLangSql(lc) {
 
     var dbdir = serverConf.dataRoot + "/" + lc + "_wikipedia_search";
     if (!stat(dbdir + "/wikivecs.tbl")) {
-        sqlByLang[lc] = null;                        // no database for this language
+        sqlByLang[lc] = null;                        // no fused db for this language
+        return null;
+    }
+
+    // model.json says which model+engine built this table; queries MUST
+    // be embedded with the same one.
+    var minfo = wikilib.readModelJson(dbdir);
+    if (!minfo || !minfo.alias) {
+        fprintf(stderr, "vecsearch: %s/model.json missing or invalid -- semantic search disabled for '%s'\n",
+                dbdir, lc);
+        sqlByLang[lc] = null;
         return null;
     }
 
     var sql = new Sql.init(dbdir);
-    if (lc == "en" || lc == "simple")
-        sql.set({ llamaEmbed: minilm });             // English-only model
-    else
-        sql.set({ llamaEmbed: bgem3 });              // multilingual model
+    wikilib.setEmbed(sql, minfo);
 
     sqlByLang[lc] = sql;
     return sql;
 }
+
+/* the reranker handle 'rr' (a llamacpp or onnx cross-encoder -- same
+   .rerank(query, text) signature, provided post-fork by the server conf
+   when available); without it, results keep their fused order.
+   NB: onnx rerank scores are sigmoid (0..1), llamacpp scores are raw
+   logits -- orderings comparable, magnitudes not. */
+function haveRR(useRerank) {
+    if (!useRerank) return false;
+    try { return typeof rr === "object" && rr &&
+                 typeof rr.rerank === "function"; }
+    catch(e) { return false; }
+}
+
+/* rerank time budget per request; set rrTooSlow when this hardware can't
+ * rerank enough candidates inside it to be useful (see the rerank stage) */
+var RR_BUDGET_MS = 5000;
+var rrTooSlow = false;
 
 // The wikipedia databases that exist (lang code -> directory name), filled per
 // request by getdblist().  Display names + rtl flags come from langdata, whose
@@ -58,65 +132,70 @@ var langdata = loadlangdata();
 var htmltop_format=sprintf('%w',
 `<!DOCTYPE HTML>
     <html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link href="https://fonts.googleapis.com/css2?family=Varela+Round&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" crossorigin="anonymous">
+    <link href="/css/site.css" rel="stylesheet">
+    <script>
+    (function(){var c=document.cookie.match(/(?:^|; )theme=([^;]*)/);
+    if(c&&c[1]==='dark')document.documentElement.setAttribute('data-theme','dark');})();
+    </script>
     <style>
-        body {font-family: arial,sans-serif;}
-        td {position:relative;}
-        #showrm {position:relative;}
         .itemwrap{ width: calc( 100%% - 70px); position: relative;display: inline-block;}
-        .owrap {width:100%%;float: left; display:inline-block;position:relative;padding-top:5px;}
         .abs { margin-right:5px;white-space: normal;}
-        .urlsp {color:#006621;max-width:100%%;overflow: hidden;text-overflow: ellipsis;white-space:nowrap;display:inline-block;font-size:.90em;}
-        .urla {text-decoration: none;font-size:16px;overflow: hidden;text-overflow: ellipsis;white-space:nowrap;display:inline-block; width: 100%%; }
-        .b { font-size: 18px; margin-left:4px; }
-        #res {font-size:12px;padding:15px 10px 0px 0px;}
-        #setbox {position:relative; padding:10px; margin:10px; background-color:#eee; border: 1px dotted gray; top:0px; left:0px;}
-        #setbox td {white-space:nowrap;}
-        .sall{ cursor: pointer;position: absolute;left: -15px;top: 0px;}
-        .ib { display: inline-block; }
-        .rm {display:none; top:24px; position:absolute; font-size: 15px;width: 12px;text-align: center;cursor:pointer; font-weight: bold;}
-        .res {margin-top: 80px;}
+        .urlsp {color:var(--rp-accent-dim);max-width:100%%;overflow: hidden;text-overflow: ellipsis;white-space:nowrap;display:inline-block;font-size:.90em;}
+        .urla {text-decoration: none;font-size:16px;overflow: hidden;text-overflow: ellipsis;white-space:nowrap;display:inline-block; width: 100%%; color: var(--rp-accent); }
+        .res {margin-top: 1rem;}
         .resi {min-height:20px;position:relative;clear:both;padding-top: 15px;}
         .nw { white-space:nowrap;}
-        .submit{height:30px; border:none; position:absolute; right:0px; width:50px;}
+        .info { color: var(--rp-text-dim); }
+        .infobox {color: var(--rp-text-dim); margin: 0 10px 0 10px;}
+        .emp { font-weight: 500; color: cornflowerblue;}
     </style>
-    <script>
-document.addEventListener('DOMContentLoaded', function() {
-    document.getElementById('langc').addEventListener('change', function(e) {
-      var selected = e.target.options[e.target.selectedIndex];
-      var sb = document.getElementById('subbut');
-      var fq = document.getElementById('fq');
-      if (selected.classList.contains('rtl')) {
-        sb.style.left = '0px';
-        fq.style.direction='rtl';
-      } else {
-        sb.style.left = '';
-        fq.style.direction='ltr';
-      }
-    });
-});
-    </script>
     </head><body>
-    <div id="lc" style="background-color: white; position: fixed; left:0px; top:0px; min-height: 300px; overflow-x: hidden; padding-right: 20px; padding-left: 20px; box-sizing: border-box; width: 200px;">
-     <div style="width:180px;height:128px;margin-bottom:15px"><img src="data:image/jpeg;base64,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" style="width:145px;height:108px;padding-left:16px;margin-top:10px">
-      【ＲａｍｐａｒｔＤＢ】</div>
-    </div>
-    <div id="main" style="padding-bottom:30px;background-color: white; position: absolute; left:200px; top:0px; min-height: 300px; overflow-x: hidden; padding-right: 20px; padding-left: 30px; box-sizing: border-box; width: 600px;">
-      <form id="mf" action="/apps/wikipedia_search/vecsearch.html">
-        <div style="width:100%%">
-          <span style="white-space:nowrap;display:block;width:550px;height:50px;position:fixed;background-color: white;z-index:10;border-bottom: lightGray 1px solid; padding-top:15px;padding-bottom:15px">
-            <div class="wtitle">%s</div>
-            <table style="background-color: white; width:100%%">
-              <tr>
-                <td style="position:relative">
-                  <input autocomplete="off" type="text" id="fq" name="q" value="%H" placeholder="Search" style="box-sizing:border-box;%smin-width:150px;width:100%%;height:30px;font:normal 18px arial,sans-serif;padding: 1px 3px;border: 2px solid #ccc;">
-                  <input id="subbut" style="%s" class="submit" type="submit" value="search">
-                </td>
-              </tr>
-            </table>
-          </span>
-        </div>
-      </form>
-      <div class="res">`
+    <nav class="navbar navbar-expand-md fixed-top">
+     <div class="container-fluid">
+      <a class="navbar-brand" href="/"><img src="/images/rampart_transparent_white.gif" alt="Rampart"></a>
+      <button id="theme-toggle" title="Toggle light/dark theme">
+       <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+       <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      </button>
+      <button class="navbar-toggler ms-auto" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" aria-expanded="false" aria-label="Toggle navigation"><span class="navbar-toggler-icon"></span></button>
+      <div class="collapse navbar-collapse" id="navbarCollapse">
+       <ul class="navbar-nav me-auto mb-2 mb-md-0">
+        <li class="nav-item"><a class="nav-link" href="/index.html">Home</a></li>
+        <li class="nav-item"><a class="nav-link" href="/download.html">Download</a></li>
+        <li class="nav-item"><a class="nav-link" href="/docs/">Docs</a></li>
+        <li class="nav-item"><a class="nav-link" href="/demos.html">Demos</a></li>
+        <li class="nav-item"><a class="nav-link" href="/help.html">Help!</a></li>
+       </ul>
+       <form class="d-flex" action="/docs/">
+        <input name="q" class="form-control me-2" type="search" placeholder="Search Docs" aria-label="Search">
+        <button class="btn btn-outline-success" type="submit">Search</button>
+       </form>
+      </div>
+     </div>
+    </nav>
+    <main class="container-main" style="padding-top:20px;">
+        <h3 style="color:var(--rp-card-heading);">Wikipedia Semantic Search</h3>
+        <p style="color:var(--rp-text-dim);font-size:0.85rem;">
+            Unified single-table search: multi-vector chunk embeddings (chunkembed) ranked by best-matching chunk, best-chunk abstracts, merged with full-text search and optionally reranked with bge-reranker-v2-m3.<br>
+            Used as the <a href="https://en.wikipedia.org/wiki/Retrieval-augmented_generation">RAG</a> backend for <a href="/llmchat/">LLM Chat Demo</a>.
+        </p>
+        <form>
+            <div class="d-flex" style="max-width:calc(100%% - 75px);gap:0.5rem;">
+            %s
+            <input class="form-control" type="text" name="q" value="%H" placeholder="Search" style="%s">
+            <button class="btn btn-outline-success" type="submit">Search</button>
+            <label class="btn btn-outline-secondary d-flex align-items-center"
+                   style="gap:0.4rem;white-space:nowrap;"
+                   title="Re-order the top results with a cross-encoder. Off shows the engine's fused (RRF) order.">
+              <input type="checkbox" name="rr" value="1" onchange="this.form.submit()"%s> Rerank
+            </label>
+            </div>
+        </form>
+        <div class="res">`
 );
 
 
@@ -124,14 +203,21 @@ function searchvec(req) {
     var q=req.query.q ? req.query.q: "";
     var dojson=false;
 
+    /* the "Rerank" checkbox: present only when checked, so absent (a first
+       load, or the box cleared) means off.  See RERANK_PARAM above. */
+    var useRerank = !!req.query[RERANK_PARAM];
+
     // language to search; e.g. /apps/wikipedia_search/vecsearch.html?q=...&lc=gl
     // If none was supplied, use the first database that exists (so the page works
     // even when English Wikipedia isn't installed).
     var lc = req.params.lc;
     if(!lc) {
+        // deterministic default: en if built, else first language alphabetically
         var avail = getdblist();
-        for(var k in avail) { lc = k; break; }
-        if(!lc) lc = "en";
+        if (avail.en)
+            lc = "en";
+        else
+            lc = Object.keys(avail).sort()[0] || "en";
     }
 
     // the per-language connection (its embedding model is already set)
@@ -146,41 +232,43 @@ function searchvec(req) {
 
     var icount=0;  //estimated total number of results, set below
     var endhtml;   // closing tags, set below
-    var ld = langdata[lc] || {};   // language display info (used for rtl)
 
     // add the htmltop text to the server's output buffer.
     // See: https://rampart.dev/docs/rampart-server.html#req-printf
+    // it includes escaped '%%' values and the 'value="%H"' format code for the query
     if(!dojson) {
-        // language menu: one <option> per database that exists (named from
-        // langdata; rtl languages get class="rtl"); the current one is selected.
+        // language menu: one <option> per database that exists, named from
+        // langdata (rtl languages get class="rtl"); the current one is selected.
+        // Changing it re-submits the form, re-running the search in that language.
         dblist = getdblist();
-        var sellst = '<select id="langc" name="lc">';
+        var sellst = '<select id="langc" class="form-select" name="lc" style="max-width:14rem;" onchange="this.form.submit()">';
         for (var key in dblist) {
             if (langdata[key])
                 sellst += '<option '+(langdata[key].rtl ? 'class="rtl" ' : '')+
-                          (key==lc ? 'SELECTED ' : '')+'value="'+key+'">'+
+                          (key==lc ? 'selected ' : '')+'value="'+key+'">'+
                           langdata[key].english+'</option>';
         }
         sellst += '</select>';
 
-        req.printf(htmltop_format, sellst, q,
-                   (ld.rtl ? 'direction:rtl;' : 'direction:ltr;'),
-                   (ld.rtl ? 'left:0px;' : '') );
+        // right-to-left input for rtl languages (Arabic, Hebrew, ...);
+        // last arg re-checks the Rerank box when this request had it set.
+        var ld = langdata[lc] || {};
+        req.printf(htmltop_format, sellst, q, (ld.rtl ? 'direction:rtl;text-align:right;' : ''),
+                   (useRerank ? ' checked' : ''));
     }
 
     // if there is a query, search for it and format the results.
     // if not, just send the endhtml.
     if(req.query.q) {
 
-        var maxCandidates = 100;  // max number of likev and likep results to evaluate
-        var maxShow = 20;         // max number of results to display
+        var maxFetch  = 40;       // fused candidates to fetch (rerank pool + slack)
+        var maxShow   = 20;       // max number of results to display
         var maxRerank = 30;       // max number of results to run through reranker
 
-        var fullres={};           // for deduplication across likev and likep results
-
         sql.set({
-            likeprows:maxCandidates,
-            qMinWordLen:2,            
+            likeprows: 100,       // keyword-side RRF pool depth
+            likevRows: 300,       // vector-side RRF pool depth
+            qMinWordLen:2,
             minwordlen:5,
             likevPqNprobe: 256,
             //alequivs: false,
@@ -188,98 +276,135 @@ function searchvec(req) {
             //useDerivations: true
         });
 
+        // The search.  Keyword and vector sides in one statement, fused by
+        // the engine into a single ranked list: one row per article,
+        // deduplicated, best first.  Everything below this line is
+        // presentation and reranking.
+        //
+        // Both '?' placeholders on the where clause get the same query
+        // string -- likep parses it as keywords, likev embeds it -- and
+        // the third feeds abstract(), which uses it to pick the snippet.
+        //
+        // Alongside the fused $rank, each row carries the two native
+        // scores that produced its pool positions:
+        //   $krank -- the keyword side's texis rank (0-1000, exactly what
+        //             a solitary likep's $rank would show); 0 = the row is
+        //             not in the keyword pool.
+        //   $vrank -- the vector side's similarity (0-100000, exactly what
+        //             a solitary likev's $rank would show); 0 = not in the
+        //             vector pool.
+        var fstart = performance.now();
+        var fres = sql.exec(
+            "select $rank score, $krank krank, $vrank vrank, Id, Title, "+
+            "abstract(Doc, 400, 'querybest', ?, Vec) Snip "+
+            "from wikivecs where Doc likep ? or Vec likev ?;",
+            {maxRows: maxFetch}, [q, q, q]);
+        var fend = performance.now();
 
-        // STAGE 1: likev search - semantic similarity using faiss ivfpq index and 
-        //          llamacpp/all-minilm-l6-v2_f16.gguf for query to semantic vector
-        var fstart=performance.now();
-        // likev does a similarity search when given a vector. Here, given a string, it's auto-converted to a vector:
-        //                                                                     Same as: Vec likev embed(?)
-        var fres = sql.exec("select $rank score, Idsec, Title, Text from wikivecs where Vec likev ?;", {maxRows: maxCandidates}, [q]);
-        var fend = performance.now()
-        // number the original order
-        fres.rows.forEach(function(r,i){
-            r.apos = r.fpos = i+1;
-            // also set the Id and paragraph/section number
-            r.Id = Math.floor(r.Idsec/1000);
-            r.Secnum = r.Idsec - r.Id*1000;
-            //r.score /= 100000; -- unused, but this is the similarity score (0-1.0 clamped; raw 0-100,000)
-            //  you could also do "select vecdist(embed(?), Vec) score ..." - but embed(?) would be evaluated twice.
-            fullres[r.Idsec] = r;
-        });
-
-        // STAGE 2: likep search - keyword
-        var sstart=performance.now();
-        var res = sql.exec("select Idsec, Title, Text from wikivecs where Text likep ?", [q], {maxRows:maxCandidates});
-        var send=performance.now();
-
-        if(!res || !res.rows) {
+        if(!fres || !fres.rows) {
             if(dojson)
                 return {json: {results:[]}}
-            return {txt: sprintf("%3J\n%3J\n", res, sql)}
+            return {txt: sprintf("%3J\n%3J\n", fres, sql)}
         }
 
-        var resrows = res.rows;
+        var resrows = fres.rows;
 
-        // number the original likep order.  Put in an object for deduplication
+        // number the fused order (used as the tie-break after reranking)
+        resrows.forEach(function(r,i){ r.fpos = i+1; });
+
+        // The reranker judges a result by its snippet, so a row without
+        // one would be scored on an empty string and sink regardless of
+        // merit.  The abstract above covers every row it is given; this
+        // fills in anything that arrives empty, for the handful of rows
+        // that reach the rerank window.
         resrows.forEach(function(r,i){
-
-            // the article/paragraph was already in the likev results
-            if( fullres[r.Idsec] ) {
-                fullres[r.Idsec].pos=i+1;
-                // keep best position
-                if( i+1 < fullres[r.Idsec].apos ) fullres[r.Idsec].apos=i+1;
-
-            // article/paragraph only in likep
-            } else {
-                r.apos = r.pos = i+1;
-                // also set the Id and paragraph/section number
-                r.Id = Math.floor(r.Idsec/1000);
-                r.Secnum = r.Idsec - r.Id*1000;
-                fullres[r.Idsec] = r;
+            if(i<maxRerank && !r.Snip) {
+                var a = sql.one(
+                    "select abstract(Doc, 400, 'querybest', ?) Snip "+
+                    "from wikivecs where Id = ?", [q, r.Id]);
+                r.Snip = a ? a.Snip : "";
             }
         });
 
-        // get results as an array
-        resrows = Object.values(fullres);
-
-        // STAGE 3: sort likev/likep results by position, then rerank top maxRerank results
-        resrows.sort( function(a,b){
-            return a.apos - b.apos
-        });
-
-        // rerank - this is the most expensive operation
+        // Rerank the best-chunk snippets with a cross-encoder -- by far
+        // the most expensive step, and the one that most improves the
+        // top few results.  The reranker 'rr' comes from the server conf;
+        // without it, results keep their fused order.
+        //
+        // Reranking is TIME-BUDGETED: on a GPU (or fast
+        // CPU) all maxRerank rows fit easily; on hardware where a single
+        // cross-encoder pass takes seconds, we stop when the budget runs
+        // out -- and if so few fit that reranking can't help, disable it
+        // for this thread and keep the fused order (the server would
+        // otherwise blow its script timeout).
         var rrstart=performance.now();
+        var useRR = haveRR(useRerank) && !rrTooSlow;
+        var nReranked = 0;
         resrows.forEach(function(r,i){
-            if(i<maxRerank)
-                r.rerank = llama_rr.rerank(q, r.Text);
-            else
+            if(useRR && i<maxRerank && (performance.now()-rrstart) < RR_BUDGET_MS) {
+                r.rerank = rr.rerank(q, sprintf("%s", r.Snip));
+                nReranked++;
+            }
+            else if(useRR)
                 r.rerank = -1000;
+            else
+                r.rerank = 0;      // no reranker: stable fused order
         });
         var rrend=performance.now();
+        if(useRR && nReranked < 5 && nReranked < Math.min(maxRerank, resrows.length)) {
+            rrTooSlow = true;
+            resrows.forEach(function(r){ r.rerank = 0; });   // fused order for this request too
+            fprintf(stderr, "vecsearch: reranking too slow here (%d of %d candidates in %dms); "+
+                    "disabled for this thread -- results keep the fused likev/likep order\n",
+                    nReranked, Math.min(maxRerank, resrows.length), Math.round(rrend-rrstart));
+        }
 
-        // sort by rerank, then by pos
+        // sort by rerank, then by fused position
         resrows.sort( function(a,b){
             if(a.rerank==b.rerank)
-                return a.apos - b.apos;
+                return a.fpos - b.fpos;
             return b.rerank - a.rerank;
         });
 
         // STAGE 4: return results -- deduplicate by doc id in the HTML version.  cut off negative rerank scores in JSON version
         // also print our performance timings
         if(!dojson && req.query_raw) {
-            req.printf('<div class="info">Semantic (likev) + keyword (likep), merged and reranked. '+
-                'timings: encode+faiss <b>%.1fms</b>, likep <b>%.1fms</b>, rerank <b>%.1fms</b>'+
-                ' &nbsp;|&nbsp; <a href="%s">JSON results</a> (as used by the <a href="/llmchat/">LLM demo</a>)</div>',
-                fend-fstart, send-sstart, rrend-rrstart,
-                req.path.url.replace('.html?','.json?'));
+            req.put('<div class="infobox">');
+            if(useRerank)
+            {
+                req.printf(`<b>Unified table: likep OR likev, RRF-fused in-engine -> reranked results:</b><br>`);
+                req.printf('<b>timings</b>: fused search (embed + likep + likev + RRF + best-chunk abstracts): <span class="emp">%.3fms</span>, rerank: <span class="emp">%.3fms</span><br>',
+                    fend-fstart, rrend-rrstart);
+                req.printf('<p style="color:var(--rp-text-dim);font-size:0.85rem;" ><a style="color:var(--rp-text-dim);font-size:0.85rem;" href="%s">Click here for json results (no negative rerank)</a>'+ 
+                    ' as seen by the <a style="color:var(--rp-text-dim);font-size:0.85rem;"  href="/llmchat/">LLM Demo</a></p>',
+                    req.path.url.replace('.html?','.json?'));
+                req.put('</div>');
+                req.printf(`<hr>
+                        <span class="abs urlsp snip"><b>%aH</b>( %aH, %aH, %aH, %aH )</span>
+                        <br>%d results<br>`, 'black','legend: ', 'cornflowerblue', 'rerankScore',
+                        'seagreen', 'kw:texis rank', 'darkorange', 'vec:similarity',
+                        'violet','fused RRF position', resrows.length);
+            } else {
+                req.printf(`<b>Unified table: likep OR likev, RRF-fused in-engine:</b><br>`);
+                req.printf('<b>timings</b>: fused search (embed + likep + likev + RRF + best-chunk abstracts): <span class="emp">%.3fms</span><br>',
+                    fend-fstart);
+                req.printf('<p style="color:var(--rp-text-dim);font-size:0.85rem;" ><a style="color:var(--rp-text-dim);font-size:0.85rem;" href="%s">Click here for json results (no negative rerank)</a>'+ 
+                    ' as seen by the <a style="color:var(--rp-text-dim);font-size:0.85rem;"  href="/llmchat/">LLM Demo</a></p>',
+                    req.path.url.replace('.html?','.json?'));
+                req.put('</div>');
+                req.printf(`<hr>
+                        <span class="abs urlsp snip"><b>%aH</b>(%aH, %aH, %aH )</span>
+                        <br>%d results<br>`, 'black','legend: ',
+                        'seagreen', 'kw:texis rank', 'darkorange', 'vec:similarity',
+                        'violet','fused RRF position', resrows.length);
+            }
         }
 
         var ntshown=0;
-        var wasSeen={};
         var i=0;
         var jsonres=[];
 
-        // JSON results are not deduplicated by title (Id)
+        // one row per ARTICLE already (the unified table dedups by design)
         resrows.some(function(row) {
             i++;
 
@@ -289,39 +414,93 @@ function searchvec(req) {
             if(dojson && row.rerank<0)
                 return true;
 
+            var snip = sprintf("%s", row.Snip || "");
+
             if(dojson)
                 jsonres.push({
                     score:row.rerank,
-                    text: row.Text,
+                    krank: row.krank,
+                    vrank: row.vrank,
+                    text: snip,
                     title: row.Title,
                     link: sprintf('https://%s.wikipedia.org/wiki?curid=%i', lc, row.Id)
                 });
-            else if(!wasSeen[row.Id]) {
-                var abs = Sql.abstract(row.Text, 400, 'querybest', '@0 ' + q, '%mbH');
-                var rtltxt = ld.rtl ? ' dir="rtl"' : '';
-                req.printf('<div class="resi" style="padding-top: 15px;"%s>'+
-                                '<span class="owrap">'+
+            else {
+                // the SQL abstract already picked the best-chunk span;
+                // this JS pass only bolds the query terms in it.
+                var abs = Sql.stringFormat('%mbH', '@0 ' + q, snip);
+                    req.printf('<div class="resi" style="padding-top: 15px;">'+
+                                '<span class="imgwrap">'+
                                 '<span class="itemwrap">'+
                                     '<span class="abs nw">'+
-                                      '<a class="urla tar" target="_blank" href="https://'+lc+'.wikipedia.org/wiki?curid=%i">%s<br>'+
-                                      '<span class="abs urlsp snip">https://'+lc+'.wikipedia.org/wiki?curid=%i &nbsp;(rerank %s)</span></a>'+
+                                      '<a class="urla tar" target="_blank" href="https://'+lc+'.wikipedia.org/wiki?curid=%i">%s</a>'+
                                     '</span>'+
+                                    '<span class="abs urlsp snip">(%aH%aH, %aH, %aH) -> https://'+lc+'.wikipedia.org/wiki?curid=%i</span>'+
                                     '<span class="abs snip"><br>%s</span>'+
                               '</span></span></div>'
-                    ,rtltxt, row.Id, row.Title, row.Id, sprintf('%.2f', row.rerank), abs);
+                    ,row.Id, row.Title, (row.rerank<0?'red':'cornflowerblue'), useRerank ? sprintf('%.4f, ',row.rerank):'',
+                    'seagreen', 'kw:'+(row.krank ? row.krank : '-'),
+                    'darkorange', 'vec:'+(row.vrank ? (row.vrank/100000).toFixed(3) : '-'),
+                    'violet', 'fused:'+(row.fpos?row.fpos:-1), row.Id, abs);
                 ntshown++;
-                wasSeen[row.Id]=true;
             }
         });
     }
 
     if(dojson)
     {
-        var timings = { likev: fend-fstart, likep: send-sstart, rerank: rrend-rrstart }
+        var timings = { fused: fend-fstart, rerank: rrend-rrstart }
         return {json: {results:jsonres, timings: timings}};
     }
 
-    endhtml='</div></div></body></html>';
+    endhtml=`</div>
+        <footer style="border-top:1px solid var(--rp-slate-light);padding:1rem 0;margin-top:2rem;">
+         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <p style="color:var(--rp-text-dim);font-size:0.85rem;margin:0;">&copy; 2026 Moat Crossing Systems. All rights reserved.</p>
+          <a target="_blank" href="/apps/editor/?file=/apps/wikipedia_search/vecsearch.js" class="btn btn-outline-success" style="font-size:0.75rem;padding:3px 10px;opacity:0.6;">View JS Source</a>
+         </div>
+        </footer>
+        </main>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.devbridge-autocomplete/1.4.11/jquery.autocomplete.min.js"></script>
+  <script>
+      $(document).ready(function(){
+        var $input = $('form.d-flex input[name=q]');
+
+        $input.autocomplete({
+          serviceUrl: '/apps/docs/rsearch/suggest.json',
+          onSelect: function(sel) {
+            if (sel.data == "search") {
+              window.location.href = "/docs/?q=" + encodeURIComponent(sel.value);
+            } else if (sel.data) {
+              window.location.href = "/docs/" + sel.data;
+            }
+          }
+        });
+
+        $input.closest('form').on('submit', function(e) {
+          e.preventDefault();
+          var q = $input.val();
+          if (q) window.location.href = "/docs/?q=" + encodeURIComponent(q);
+        });
+
+        // Theme toggle
+        $('#theme-toggle').on('click', function() {
+          var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+          if (isDark) {
+            document.documentElement.removeAttribute('data-theme');
+            document.cookie = 'theme=light; path=/; max-age=31536000; SameSite=Lax';
+          } else {
+            document.documentElement.setAttribute('data-theme', 'dark');
+            document.cookie = 'theme=dark; path=/; max-age=31536000; SameSite=Lax';
+          }
+        });
+      });
+        </script>
+        </body></html>`;
     return({html:endhtml});
 }
 
@@ -341,7 +520,8 @@ function getdblist() {
 
     for(;i<res.length;i++) {
         var entry = res[i];
-        var parts = entry.match(/([^_]+)_wikipedia_search/);
+        // anchored: "bak.en_wikipedia_search" etc must NOT match
+        var parts = entry.match(/^([a-z]+)_wikipedia_search$/);
         if(parts && parts.length>1) {
             ret[parts[1]]=parts[0];
         }

@@ -1,16 +1,15 @@
+#!/bin/bash
+
+cd "$(dirname "$0")" || exit 1
+
 die() {
-	echo $1
-	exit 1
+    echo "$1"
+    exit 1
 }
 
-RP=`which rampart`;
+RP=`which rampart`
+[ -z "$RP" ] && die "Cannot find rampart executable in your path"
 
-if [ "$RP" == "" ]; then
-	echo "Cannot find rampart executable in your path"
-	exit 1;
-fi
-
-ls ./data/wikipedia_search/ 2>&1 1>/dev/null || die "could not find './data/wikipedia_search/' directory.  Has the db been build?"
+ls ./data/*_wikipedia_search &>/dev/null || die "No ./data/<lang>_wikipedia_search database found.  Build one with ../make-wiki-search.sh first."
 
 $RP ./web_server_conf.js
-
