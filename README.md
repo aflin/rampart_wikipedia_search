@@ -1,4 +1,4 @@
-# rws2 — Rampart Wikipedia Search
+# Rampart Wikipedia Search Demo
 
 A demo search of Wikipedia (in one or several languages of your choice)
 using the Rampart SQL module on Linux or macOS.  Two builds are offered:
