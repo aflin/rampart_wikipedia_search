@@ -105,8 +105,8 @@ An interrupted embedding run can be resumed: re-run the build and choose
 
 ## Required
 
-1. [Rampart JavaScript](https://github.com/aflin/rampart) plus
-   rampart-langtools (for the fused build)
+1. [Rampart JavaScript](https://github.com/aflin/rampart) version ≥ 0.7.1
+   plus rampart-langtools (for the fused build)
 2. curl
 3. A C compiler (for the embedded C in wikiparser/wikiparser.js)
 4. bzcat (part of the bzip2 package)
