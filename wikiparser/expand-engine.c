@@ -1599,6 +1599,62 @@ static int call_parser_function(expand_ctx *ec, slice_t funcname,
     return handled;
 }
 
+/* A found template that expanded to nothing is usually INTENTIONALLY
+   empty (tracking/maintenance: lowercasecheck, Use dmy dates, SDcat...)
+   -- emitting its parameters would inject duplicate or metadata text
+   into the article.  The one case where the parameters DO carry the
+   display content is a Lua display wrapper: a body that is essentially
+   `{{#invoke:...}}` at top level (infoboxes, asbox, etc.), which we
+   can't run.  Detect that shape: effective start of the body -- after
+   whitespace, HTML comments, <noinclude> blocks, <includeonly> tags
+   and a subst:/safesubst: prefix -- is `{{ #invoke:`. */
+static int tpl_body_is_invoke_wrapper(const char *s, int len) {
+    const char *p = s, *end = s + len;
+    int in_braces = 0;
+    while (p < end) {
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') { p++; continue; }
+        if (end - p >= 4 && memcmp(p, "<!--", 4) == 0) {
+            const char *c = (const char *)memmem(p + 4, end - (p + 4), "-->", 3);
+            p = c ? c + 3 : end;
+            continue;
+        }
+        if (end - p >= 10 && strncasecmp(p, "<noinclude", 10) == 0) {
+            const char *c = (const char *)memmem(p, end - p, "</noinclude>", 12);
+            p = c ? c + 12 : end;
+            continue;
+        }
+        if (end - p >= 13 && strncasecmp(p, "<includeonly>", 13) == 0) { p += 13; continue; }
+        if (end - p >= 14 && strncasecmp(p, "</includeonly>", 14) == 0) { p += 14; continue; }
+        if (!in_braces) {
+            if (end - p >= 2 && p[0] == '{' && p[1] == '{') { in_braces = 1; p += 2; continue; }
+            return 0;
+        }
+        if (end - p >= 10 && strncasecmp(p, "safesubst:", 10) == 0) { p += 10; continue; }
+        if (end - p >= 6 && strncasecmp(p, "subst:", 6) == 0) { p += 6; continue; }
+        return (end - p >= 8 && strncasecmp(p, "#invoke:", 8) == 0);
+    }
+    return 0;
+}
+
+/* Named parameters that are maintenance metadata everywhere they
+   appear -- never article text.  Skipped by the parameter-extraction
+   fallbacks below ("date=October 2024" from {{Use dmy dates}},
+   "category=... stubs" from {{asbox}}, etc.). */
+static int is_metadata_param_name(const char *s, int len) {
+    switch (len) {
+    case 2: return strncasecmp(s, "df", 2) == 0;
+    case 3: return strncasecmp(s, "cat", 3) == 0 ||
+                   strncasecmp(s, "bot", 3) == 0;
+    case 4: return strncasecmp(s, "date", 4) == 0;
+    case 6: return strncasecmp(s, "plural", 6) == 0 ||
+                   strncasecmp(s, "reason", 6) == 0;
+    case 8: return strncasecmp(s, "category", 8) == 0 ||
+                   strncasecmp(s, "pagetype", 8) == 0;
+    case 13: return strncasecmp(s, "fix-attempted", 13) == 0;
+    }
+    return 0;
+}
+
 /* ================================================================
    Core expansion: expand_single_template
    ================================================================ */
@@ -1716,6 +1772,8 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
                 else if (c == '=' && d == 0) { eqpos = k; break; }
             }
             if (eqpos >= 0 && eqpos < 40) {
+                slice_t pnm = slice_trim(make_slice(p.ptr, eqpos));
+                if (is_metadata_param_name(pnm.ptr, pnm.len)) continue;
                 val = slice_trim(make_slice(p.ptr + eqpos + 1, p.len - eqpos - 1));
             }
             if (val.len == 0) continue;
@@ -1920,7 +1978,8 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
                 break;
             }
         }
-        if (!has_content && nparts > 1) {
+        if (!has_content && nparts > 1 &&
+            tpl_body_is_invoke_wrapper(tpl_text, tpl_len)) {
             out->len = out_before;
             int emitted = 0;
             for (int pi = 1; pi < nparts; pi++) {
@@ -1935,6 +1994,8 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
                     else if (c == '=' && d == 0) { eqpos = k; break; }
                 }
                 if (eqpos >= 0 && eqpos < 40) {
+                    slice_t pnm = slice_trim(make_slice(p.ptr, eqpos));
+                    if (is_metadata_param_name(pnm.ptr, pnm.len)) continue;
                     val = slice_trim(make_slice(p.ptr + eqpos + 1, p.len - eqpos - 1));
                 }
                 if (val.len < 3) continue;
@@ -2085,14 +2146,54 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
    Pass 1.5: Flatten sentinels and build origin map
    ================================================================ */
 
+/* Word-character classification for the glue guards below.  A "word"
+   byte is ASCII alphanumeric or the lead of a multibyte sequence
+   outside the two punctuation-heavy blocks: C2 (Latin-1 supplement:
+   NBSP, degree, section...) and E2 (general punctuation: dashes,
+   quotes, ZWNJ...).  Coarse on purpose — the guards only decide
+   whether a missing separator would visibly glue two words. */
+static int wordish_lead(unsigned char c) {
+    if (c < 0x80) return isalnum(c) != 0;
+    if (c == 0xC2 || c == 0xE2) return 0;
+    return c >= 0xC3;
+}
+
+/* Does `out' end with a word character?  (Skips sentinel bytes, backs
+   over UTF-8 continuation bytes to the lead.) */
+static int rp_tail_wordish(rp_string *out) {
+    size_t j = out->len;
+    while (j > 0 && (out->str[j-1] == '\x01' || out->str[j-1] == '\x02')) j--;
+    if (j == 0) return 0;
+    unsigned char c = (unsigned char)out->str[j-1];
+    if (c < 0x80) return isalnum(c) != 0;
+    size_t k = j - 1;
+    int back = 0;
+    while (k > 0 && back < 3 &&
+           ((unsigned char)out->str[k] & 0xC0) == 0x80) { k--; back++; }
+    return wordish_lead((unsigned char)out->str[k]);
+}
+
+/* Does the text at q begin with a word character?  (Skips sentinels;
+   a bare continuation byte counts as mid-word.) */
+static int next_wordish(const char *q, const char *end) {
+    while (q < end && (*q == '\x01' || *q == '\x02')) q++;
+    if (q >= end) return 0;
+    unsigned char c = (unsigned char)*q;
+    if (c < 0x80) return isalnum(c) != 0;
+    if ((c & 0xC0) == 0x80) return 1;
+    return wordish_lead(c);
+}
+
 static void flatten_sentinels(const char *text, int len,
                                rp_string *out, origin_map *origins) {
     int tpl_depth = 0;
+    int boundary = 0;
     for (int i = 0; i < len; i++) {
         if (text[i] == '\x01') {
             tpl_depth++;
             /* Keep outermost sentinel in output */
             if (tpl_depth == 1) rp_string_putc(out, '\x01');
+            boundary = 1;
             continue;
         }
         if (text[i] == '\x02') {
@@ -2101,7 +2202,21 @@ static void flatten_sentinels(const char *text, int len,
                 /* Keep outermost sentinel in output */
                 if (tpl_depth == 0) rp_string_putc(out, '\x02');
             }
+            boundary = 1;
             continue;
+        }
+        /* Glue guard: a template-expansion boundary between two word
+           characters means some construct failed to provide its own
+           separator (bad fallback, Lua gap...).  Degrade to a stray
+           space instead of a glued word. */
+        if (boundary) {
+            if (rp_tail_wordish(out) && next_wordish(text + i, text + len)) {
+                int spos = (int)out->len;
+                rp_string_putc(out, ' ');
+                if (tpl_depth > 0)
+                    origin_map_set(origins, spos);
+            }
+            boundary = 0;
         }
         int pos = (int)out->len;
         rp_string_putc(out, text[i]);
@@ -2121,6 +2236,27 @@ static inline int starts_ci(const char *p, int avail, const char *str, int slen)
         if (tolower((unsigned char)p[i]) != tolower((unsigned char)str[i])) return 0;
     }
     return 1;
+}
+
+/* Is the tag at p (pointing at '<', with `gt' its closing '>') a
+   BLOCK-level element?  A stripped block tag is a rendering boundary:
+   words on either side of it were never adjacent on screen. */
+static int is_block_tag(const char *p, const char *gt) {
+    static const char *btags[] = {"div","p","table","caption","tr","td",
+                                  "th","li","ul","ol","dl","dd","dt",
+                                  "blockquote","center","section","figure",
+                                  "figcaption","pre","hr",
+                                  "h1","h2","h3","h4","h5","h6",NULL};
+    const char *n = p + 1;
+    if (n < gt && *n == '/') n++;
+    int nlen = 0;
+    while (n + nlen < gt && isalnum((unsigned char)n[nlen])) nlen++;
+    if (nlen == 0) return 0;
+    for (int t = 0; btags[t]; t++) {
+        int bl = (int)strlen(btags[t]);
+        if (bl == nlen && strncasecmp(n, btags[t], nlen) == 0) return 1;
+    }
+    return 0;
 }
 
 /* Check if position q is at the start of a line, skipping sentinel bytes.
@@ -2991,10 +3127,18 @@ static void cleanup_expanded_text(const char *text, int len, rp_string *out,
                     }
                 }
             }
-            /* Generic HTML tag — strip tag, keep content */
+            /* Generic HTML tag — strip tag, keep content.  Dropping a
+               BLOCK-level tag between two word characters would glue
+               words that were never adjacent on screen (e.g.
+               "...player</div>Japanese...") — degrade to a space. */
             if (p + 1 < end && (isalpha((unsigned char)p[1]) || p[1] == '/')) {
                 const char *gt = memchr(p, '>', end - p);
-                if (gt && (gt - p) < 2000) { p = gt + 1; break; }
+                if (gt && (gt - p) < 2000) {
+                    if (is_block_tag(p, gt) && rp_tail_wordish(out) &&
+                        next_wordish(gt + 1, end))
+                        EMIT_CHAR(out, ' ', last, consec_nl, line_alpha, line_start_pos);
+                    p = gt + 1; break;
+                }
             }
             /* Not a tag, emit literal < */
             EMIT_CHAR(out, '<', last, consec_nl, line_alpha, line_start_pos);
