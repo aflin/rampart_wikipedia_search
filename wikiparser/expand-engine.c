@@ -3423,9 +3423,20 @@ static void cleanup_expanded_text(const char *text, int len, rp_string *out,
         case 0xE2:
             if (p + 2 < end) {
                 unsigned char b2 = p[1], b3 = p[2];
-                if (b2 == 0x80 && ((b3 >= 0x80 && b3 <= 0x8D) || b3 == 0xA8 ||
-                    b3 == 0xA9 || b3 == 0xAF)) {
+                /* U+2000-U+200B: genuine spaces (quads, thin, hair, ZWSP)
+                   -> plain space.  U+200C ZWNJ and U+200D ZWJ are NOT
+                   spaces: ZWNJ is orthographically required inside
+                   Persian/Arabic words (nim-fasele) and ZWJ binds emoji
+                   and Indic conjuncts -- both pass through verbatim.
+                   (texis tokenizes at them anyway, so search behavior is
+                   unchanged; display and embeddings keep correct words.) */
+                if (b2 == 0x80 && ((b3 >= 0x80 && b3 <= 0x8B) || b3 == 0xAF)) {
                     EMIT_CHAR(out, ' ', last, consec_nl, line_alpha, line_start_pos);
+                    p += 3; break;
+                }
+                /* U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR */
+                if (b2 == 0x80 && (b3 == 0xA8 || b3 == 0xA9)) {
+                    EMIT_CHAR(out, '\n', last, consec_nl, line_alpha, line_start_pos);
                     p += 3; break;
                 }
                 if (b2 == 0x81 && b3 == 0x9F) {
