@@ -258,6 +258,7 @@ var expandExportFunc = `
 
     /* Pass 1: Template expansion (output has \\x01/\\x02 sentinels) */
     rp_string *expanded = rp_string_new(text_len + 1024);
+    ec.root_out = expanded; /* block-vs-inline context detection */
     wiki_expand(&ec, text, (int)text_len, 0, expanded);
 
     if (do_cleanup) {

@@ -266,6 +266,9 @@ typedef struct {
 
     int           call_count;
     double        start_time;
+
+    rp_string    *root_out;       /* document-level output buffer, for
+                                     block-vs-inline context detection */
 } expand_ctx;
 
 /* ================================================================
@@ -1647,12 +1650,152 @@ static int is_metadata_param_name(const char *s, int len) {
                    strncasecmp(s, "bot", 3) == 0;
     case 4: return strncasecmp(s, "date", 4) == 0;
     case 6: return strncasecmp(s, "plural", 6) == 0 ||
-                   strncasecmp(s, "reason", 6) == 0;
+                   strncasecmp(s, "reason", 6) == 0 ||
+                   strncasecmp(s, "italic", 6) == 0;
     case 8: return strncasecmp(s, "category", 8) == 0 ||
                    strncasecmp(s, "pagetype", 8) == 0;
     case 13: return strncasecmp(s, "fix-attempted", 13) == 0;
     }
     return 0;
+}
+
+/* Generic prose-shape test for fallback parameter emission.  Language-
+   independent: counts whitespace-separated words and the share of digit
+   characters (ASCII, Arabic-Indic U+0660-0669, Extended Arabic-Indic
+   U+06F0-06F9, Devanagari U+0966-096F).  Infobox data values look the
+   same in every language — a bare name, a code, a quantity, a date —
+   while parameter values worth keeping (short descriptions, inline
+   annotations) have several words and are mostly letters.  Digits in
+   scripts not listed above simply count as letters, which errs toward
+   keeping the value. */
+static int count_words_chars_digits(const char *p, int len,
+                                    int *charsp, int *digitsp) {
+    int words = 0, in_word = 0;
+    int chars = 0, digits = 0;
+    for (int k = 0; k < len; k++) {
+        unsigned char c = (unsigned char)p[k];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { in_word = 0; continue; }
+        if (!in_word) { words++; in_word = 1; }
+        if ((c & 0xC0) == 0x80) continue; /* UTF-8 continuation byte */
+        chars++;
+        if (c >= '0' && c <= '9') digits++;
+        else if (c == 0xD9 && k+1 < len &&
+                 (unsigned char)p[k+1] >= 0xA0 &&
+                 (unsigned char)p[k+1] <= 0xA9) digits++;
+        else if (c == 0xDB && k+1 < len &&
+                 (unsigned char)p[k+1] >= 0xB0 &&
+                 (unsigned char)p[k+1] <= 0xB9) digits++;
+        else if (c == 0xE0 && k+2 < len &&
+                 (unsigned char)p[k+1] == 0xA5 &&
+                 (unsigned char)p[k+2] >= 0xA6 &&
+                 (unsigned char)p[k+2] <= 0xAF) digits++;
+    }
+    *charsp = chars;
+    *digitsp = digits;
+    return words;
+}
+
+/* Prose-shape test on a RAW wikitext parameter value: nested {{...}}
+   spans and <...> tags are invisible here ("175 cm<ref name=x/>" is two
+   words, not three) since they don't survive as text. */
+static int value_is_proseish(slice_t val, int min_words) {
+    int words = 0, in_word = 0;
+    int chars = 0, digits = 0;
+    int tdepth = 0;
+    for (int k = 0; k < val.len; k++) {
+        unsigned char c = (unsigned char)val.ptr[k];
+        if (c == '{' && k+1 < val.len && val.ptr[k+1] == '{') { tdepth++; k++; in_word = 0; continue; }
+        if (c == '}' && k+1 < val.len && val.ptr[k+1] == '}') { if (tdepth > 0) tdepth--; k++; continue; }
+        if (tdepth > 0) continue;
+        if (c == '<') {
+            if (k+3 < val.len && memcmp(val.ptr + k, "<!--", 4) == 0) {
+                /* skip the whole comment */
+                const char *e = (const char *)memmem(val.ptr + k + 4,
+                                                     val.len - k - 4, "-->", 3);
+                k = e ? (int)(e - val.ptr) + 2 : val.len;
+            } else { /* skip the tag itself */
+                while (k < val.len && val.ptr[k] != '>') k++;
+            }
+            in_word = 0;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { in_word = 0; continue; }
+        if (!in_word) { words++; in_word = 1; }
+        if ((c & 0xC0) == 0x80) continue; /* UTF-8 continuation byte */
+        chars++;
+        if (c >= '0' && c <= '9') digits++;
+        else if (c == 0xD9 && k+1 < val.len &&
+                 (unsigned char)val.ptr[k+1] >= 0xA0 &&
+                 (unsigned char)val.ptr[k+1] <= 0xA9) digits++;
+        else if (c == 0xDB && k+1 < val.len &&
+                 (unsigned char)val.ptr[k+1] >= 0xB0 &&
+                 (unsigned char)val.ptr[k+1] <= 0xB9) digits++;
+        else if (c == 0xE0 && k+2 < val.len &&
+                 (unsigned char)val.ptr[k+1] == 0xA5 &&
+                 (unsigned char)val.ptr[k+2] >= 0xA6 &&
+                 (unsigned char)val.ptr[k+2] <= 0xAF) digits++;
+    }
+    if (words < min_words) return 0;
+    /* Half digits = data, not prose.  Not stricter than half: dates in
+       running text ("born 28 July 1996") are digit-heavy prose and losing
+       them costs more than a leaked rank/date data line. */
+    if (digits * 2 >= chars) return 0;
+    return 1;
+}
+
+/* Expand a fallback-emitted parameter value with HTML comments removed —
+   comments never carry content, and a value's trailing comment would
+   otherwise leak as "-- foo -->" debris after cleanup. */
+static void expand_value_sans_comments(expand_ctx *ec, slice_t val,
+                                       int depth, rp_string *out) {
+    if (val.len < 4 || !memmem(val.ptr, val.len, "<!--", 4)) {
+        wiki_expand(ec, val.ptr, val.len, depth, out);
+        return;
+    }
+    rp_string *tmp = rp_string_new(val.len);
+    const char *p = val.ptr, *end = val.ptr + val.len;
+    while (p < end) {
+        const char *c = (const char *)memmem(p, end - p, "<!--", 4);
+        if (!c) { rp_string_putsn(tmp, p, (int)(end - p)); break; }
+        rp_string_putsn(tmp, p, (int)(c - p));
+        const char *e = (const char *)memmem(c + 4, end - (c + 4), "-->", 3);
+        p = e ? e + 3 : end;
+    }
+    wiki_expand(ec, tmp->str, (int)tmp->len, depth, out);
+    rp_string_free(tmp);
+}
+
+/* BCP47-style language tag: "ang-Latn", "grc-Latn" — 2-3 lowercase
+   letters, hyphen, titlecase 4-letter script.  Leaks from lang
+   templates in any language edition. */
+static int value_is_lang_tag(slice_t val) {
+    int i = 0;
+    while (i < val.len && val.ptr[i] >= 'a' && val.ptr[i] <= 'z') i++;
+    if (i < 2 || i > 3 || i >= val.len || val.ptr[i] != '-') return 0;
+    if (val.len - i - 1 != 4) return 0;
+    const char *p = val.ptr + i + 1;
+    return p[0] >= 'A' && p[0] <= 'Z' &&
+           p[1] >= 'a' && p[1] <= 'z' &&
+           p[2] >= 'a' && p[2] <= 'z' &&
+           p[3] >= 'a' && p[3] <= 'z';
+}
+
+/* Is the expansion output currently at the start of a line?  Looks back
+   over sentinels and spaces.  Decides fallback strictness: a template
+   whose output lands mid-sentence is an inline annotation (lang tags,
+   units — keep short values); one at a line start is block chrome
+   (infobox, navbox — data-field params, filter hard).  Reaching the
+   start of the buffer is only "start of document" for the root output
+   buffer; a nested buffer (parameter value, sub-expansion) starting
+   mid-sentence must count as inline. */
+static int out_at_line_start(expand_ctx *ec, rp_string *out, size_t from) {
+    size_t k = from;
+    while (k > 0) {
+        char c = out->str[k-1];
+        if (c == '\x01' || c == '\x02' || c == ' ' || c == '\t') { k--; continue; }
+        return c == '\n';
+    }
+    return out == ec->root_out;
 }
 
 /* ================================================================
@@ -1756,6 +1899,7 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
            and emit it if it looks like useful text. Join with single
            newlines so they don't become separate search paragraphs. */
         int emitted = 0;
+        int block_ctx = out_at_line_start(ec, out, out->len);
         for (int pi = 1; pi < nparts; pi++) {
             /* For #invoke, Part 1 is the Lua function name — skip it */
             if (is_invoke && pi == 1) continue;
@@ -1909,9 +2053,20 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
                 }
             }
 
+            /* Language-tag debris from lang templates ("ang-Latn") */
+            if (value_is_lang_tag(val)) continue;
+
+            /* Block context only: unknown templates on their own line are
+               mostly infoboxes/nav chrome whose params are data fields in
+               any language — require prose-shaped values (three words
+               minimum, mostly letters).  Inline templates are annotations
+               (foreign names, numbers with units) whose short values
+               belong to the surrounding sentence — keep them. */
+            if (block_ctx && !value_is_proseish(val, 3)) continue;
+
             /* Recursively expand the value (it may contain templates) */
             if (emitted > 0) rp_string_putc(out, '\n'); /* single newline */
-            wiki_expand(ec, val.ptr, val.len, depth + 1, out);
+            expand_value_sans_comments(ec, val, depth + 1, out);
             emitted++;
         }
 
@@ -1982,6 +2137,7 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
             tpl_body_is_invoke_wrapper(tpl_text, tpl_len)) {
             out->len = out_before;
             int emitted = 0;
+            int block_ctx = out_at_line_start(ec, out, out_before);
             for (int pi = 1; pi < nparts; pi++) {
                 slice_t p = slice_trim(parts[pi]);
                 if (p.len == 0) continue;
@@ -2131,8 +2287,18 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
                         if (_ao) continue;
                     }
                 }
+                /* Language-tag debris from lang templates ("ang-Latn") */
+                if (value_is_lang_tag(val)) continue;
+                /* Block context only (see the not-found fallback): filter
+                   data-field params to prose-shaped values.  Two-word
+                   minimum (not three) so short descriptions like
+                   "Iranian footballer" survive — this path is gated to
+                   invoke wrappers, whose params are likelier to carry
+                   display content.  Inline: keep short values (foreign
+                   names from lang wrappers belong to the sentence). */
+                if (block_ctx && !value_is_proseish(val, 2)) continue;
                 if (emitted > 0) rp_string_putc(out, ' ');
-                wiki_expand(ec, val.ptr, val.len, depth + 1, out);
+                expand_value_sans_comments(ec, val, depth + 1, out);
                 emitted++;
             }
         }
@@ -2736,6 +2902,21 @@ static void filter_debris(const char *text, int len, rp_string *out,
 
             /* CSS: color:#hex */
             if (!discard && dlen < 40 && memmem(dp, dlen, ":#", 2)) discard = 1;
+
+            /* Short digit-heavy standalone lines: bare infobox data values
+               (years, coordinates, populations) in any script.  ASCII
+               equivalents are already dropped by the short non-alpha rule
+               below; this extends the same policy to non-ASCII digits.
+               Only for segments bounded by real newlines — segments cut
+               by sentinels are inline template output ("6,000" from
+               {{formatnum}} mid-sentence), which belongs to its prose. */
+            if (!discard && dlen < 16 &&
+                (line_start == 0 || text[line_start-1] == '\n') &&
+                (line_end == len || text[line_end] == '\n')) {
+                int chars, digits;
+                count_words_chars_digits(dp, dlen, &chars, &digits);
+                if (chars > 0 && digits * 2 >= chars) discard = 1;
+            }
 
             /* Very short non-alpha lines (but preserve {| and |} for table handling) */
             if (!discard && dlen < 5) {
@@ -3811,6 +3992,14 @@ static void cleanup_expanded_text(const char *text, int len, rp_string *out,
                     continue;
                 /* Line starting with " is always a broken attribute fragment */
                 if (s[ts] == '"') continue;
+            }
+            /* Short digit-heavy template-origin lines: bare infobox data
+               values (years, coordinates) in any script — same policy the
+               EMIT_CHAR path applies to ASCII digit lines. */
+            if (line_from_tpl && tlen > 0 && tlen < 16) {
+                int _chars, _digits;
+                count_words_chars_digits(s+ts, tlen, &_chars, &_digits);
+                if (_chars > 0 && _digits * 2 >= _chars) continue;
             }
             /* Discard bare HTML attribute values that leak as single words */
             if (tlen == 5 && strncasecmp(s+ts, "vcard", 5) == 0) continue;
