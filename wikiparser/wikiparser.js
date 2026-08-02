@@ -179,6 +179,15 @@ var scanExportFunc = `
             if (match_at(p, "</page>", 7)) state = S_OUTSIDE;
             break;
         }
+        /* A line longer than BUFSZ arrives split at an arbitrary byte, so
+           "</text>" can straddle the boundary and be invisible to both
+           chunks -- the entry's length would then run into the NEXT page.
+           Rewind by the tag length so the next read re-covers the seam. */
+        if (state == S_IN_TEXT && line_len == BUFSZ - 1 &&
+            buf[line_len - 1] != '\\n' && line_len > 8) {
+            fseek(fp, -7L, SEEK_CUR);
+            line_len -= 7;
+        }
         file_pos += (int64_t)line_len;
     }
 done:
@@ -280,10 +289,14 @@ var expandExportFunc = `
         origin_map_free(origins2);
         rp_string_free(filtered);
 
-        duk_push_lstring(ctx, cleaned->str, cleaned->len);
+        /* Safe push: dirty dump bytes or an engine bug must never put
+           invalid UTF-8 into a JS string (duktape string ops throw
+           "internal error" on it).  Invalid sequences become U+FFFD;
+           valid text is pushed zero-copy. */
+        duk_rp_push_lstring_safe(ctx, cleaned->str, cleaned->len);
         rp_string_free(cleaned);
     } else {
-        duk_push_lstring(ctx, expanded->str, expanded->len);
+        duk_rp_push_lstring_safe(ctx, expanded->str, expanded->len);
         rp_string_free(expanded);
     }
 
@@ -577,9 +590,10 @@ function buildPageMagicWords(title, siteinfo) {
         'NAMESPACE': ns,
         'NAMESPACEE': encodeURIComponent(ns),
         'NAMESPACENUMBER': nsNum,
-        'BASEPAGENAME': slash >= 0 ? pagename.substring(0, slash) : pagename,
-        'SUBPAGENAME': slash >= 0 ? pagename.substring(slash + 1) : '',
-        'ROOTPAGENAME': slash >= 0 ? pagename.substring(0, pagename.indexOf('/')) : pagename,
+        /* BASEPAGENAME = all but the last /segment; ROOTPAGENAME = first */
+        'BASEPAGENAME': slash >= 0 ? pagename.substring(0, pagename.lastIndexOf('/')) : pagename,
+        'SUBPAGENAME': slash >= 0 ? pagename.substring(pagename.lastIndexOf('/') + 1) : '',
+        'ROOTPAGENAME': slash >= 0 ? pagename.substring(0, slash) : pagename,
         'TALKPAGENAME': '',
         'SUBJECTPAGENAME': title,
         'ARTICLEPAGENAME': title,
@@ -698,6 +712,11 @@ function scan(dumpFile, lmdbPath, options) {
     var startTime = performance.now();
 
     var total = scanWikiDump(dumpFile, function(ns, title, offset, length, isRedirect, filePos, pageId) {
+        /* Dump titles are XML-escaped ("AT&amp;T"). Keys must hold the
+           REAL title: article text is entity-decoded before expansion, so
+           template lookups arrive decoded ("{{R&B ...}}"), and extract()
+           hands the key back as the article title. */
+        if (title.indexOf('&') >= 0) title = sprintf("%!H", title);
         lmdb.put(db, ns + ":" + title, {offset: offset, length: length, redirect: isRedirect, id: pageId});
         pageCount++;
         if (ns === "0") {
@@ -790,7 +809,7 @@ function extract(dumpFile, lmdbPath, options) {
     var txn = new lmdb.transaction(db, false);
     var row = txn.cursorGet(lmdb.op_setRange, startCursor, true);
 
-    var count = 0, skipped = 0;
+    var count = 0, skipped = 0, errors = 0;
     var startTime = performance.now();
 
     while (row && row.key && row.key.indexOf("0:") === 0) {
@@ -824,7 +843,11 @@ function extract(dumpFile, lmdbPath, options) {
                     skipped++; /* empty result from expansion */
                 }
             } catch(e) {
+                /* Never silently lose an article: report which one and why */
                 skipped++;
+                errors++;
+                fprintf(stderr, "wikiparser.extract: '%s' failed: %s\n",
+                        title, e.message || e);
             }
         } else {
             skipped++;
@@ -839,6 +862,7 @@ function extract(dumpFile, lmdbPath, options) {
     return {
         articles: count,
         skipped: skipped,
+        errors: errors,
         elapsed: elapsed,
         rate: count / elapsed
     };

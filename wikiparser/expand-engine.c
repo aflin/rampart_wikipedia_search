@@ -351,7 +351,9 @@ static inline int limits_exceeded(expand_ctx *ec) {
    ================================================================ */
 
 static int split_parts(const char *text, int len, slice_t *parts, int max_parts) {
+#if PP_DEBUG
     int _has_mf = (len > 10 && memmem(text, len, "<mapfr", 6) != NULL);
+#endif
     int n = 0, depth = 0, bdepth = 0, sdepth = 0, start = 0;
     for (int i = 0; i < len && n < max_parts - 1; i++) {
         char c = text[i];
@@ -390,7 +392,9 @@ static int split_parts(const char *text, int len, slice_t *parts, int max_parts)
         else if (c == '[' && i + 1 < len && text[i+1] == '[') { bdepth++; i++; }
         else if (c == ']' && i + 1 < len && text[i+1] == ']') { bdepth--; i++; }
         else if (c == '|' && depth == 0 && bdepth == 0 && sdepth == 0) {
+#if PP_DEBUG
             if (_has_mf) DBG("SPLIT at %d: part[%d] = %.40s\n", i, n, text + start);
+#endif
             parts[n++] = make_slice(text + start, i - start);
             start = i + 1;
         }
@@ -414,9 +418,11 @@ static void pp_doc_init(pp_doc *doc) {
     doc->node_cap = PP_INIT_NODES;
     doc->node_count = 0;
     doc->nodes = (pp_node *)malloc(sizeof(pp_node) * doc->node_cap);
+    if (!doc->nodes) doc->node_cap = 0;   /* pp_alloc_node retries/fails cleanly */
     doc->part_cap = PP_INIT_PARTS;
     doc->part_count = 0;
     doc->parts = (pp_part *)malloc(sizeof(pp_part) * doc->part_cap);
+    if (!doc->parts) doc->part_cap = 0;
 }
 
 static void pp_doc_free(pp_doc *doc) {
@@ -427,7 +433,7 @@ static void pp_doc_free(pp_doc *doc) {
 /* Allocate a node, growing array if needed. Returns index, or -1 on failure. */
 static int pp_alloc_node(pp_doc *doc) {
     if (doc->node_count >= doc->node_cap) {
-        int new_cap = doc->node_cap * 2;
+        int new_cap = doc->node_cap ? doc->node_cap * 2 : PP_INIT_NODES;
         pp_node *p = (pp_node *)realloc(doc->nodes, sizeof(pp_node) * new_cap);
         if (!p) return -1;
         doc->nodes = p;
@@ -441,7 +447,7 @@ static int pp_alloc_node(pp_doc *doc) {
 /* Allocate a part, growing array if needed. Returns index, or -1 on failure. */
 static int pp_alloc_part(pp_doc *doc) {
     if (doc->part_count >= doc->part_cap) {
-        int new_cap = doc->part_cap * 2;
+        int new_cap = doc->part_cap ? doc->part_cap * 2 : PP_INIT_PARTS;
         pp_part *p = (pp_part *)realloc(doc->parts, sizeof(pp_part) * new_cap);
         if (!p) return -1;
         doc->parts = p;
@@ -480,6 +486,7 @@ static void pp_emit_text(pp_doc *doc, int part_idx, const char *ptr, int len) {
         }
     }
     int idx = pp_alloc_node(doc);
+    if (idx < 0) return;    /* alloc failure: drop rather than write nodes[-1] */
     doc->nodes[idx].type = PP_TEXT;
     doc->nodes[idx].text_ptr = ptr;
     doc->nodes[idx].text_len = len;
@@ -645,9 +652,11 @@ static void wiki_preprocess(const char *text, int len, pp_doc *doc) {
                 remaining -= use;
             }
 
-            /* Any remaining single { is literal */
-            if (remaining == 1) {
-                pp_emit_text(doc, current_part, text + pos, 1);
+            /* Any remaining braces are literal: a single leftover {, or
+               2+ that could not be pushed because the frame stack is
+               full — emit them as text rather than losing them. */
+            if (remaining > 0) {
+                pp_emit_text(doc, current_part, text + pos, remaining);
             }
 
             text_start = i; /* past the brace run */
@@ -693,10 +702,12 @@ static void wiki_preprocess(const char *text, int len, pp_doc *doc) {
                 int compact_start = doc->part_count;
                 for (int fp = 0; fp < frame->nparts; fp++) {
                     int new_idx = pp_alloc_part(doc);
+                    if (new_idx < 0) break;
                     doc->parts[new_idx] = doc->parts[frame->part_indices[fp]];
                 }
 
                 int node_idx = pp_alloc_node(doc);
+                if (node_idx < 0) { stack_depth--; break; }
                 doc->nodes[node_idx].type = ntype;
                 doc->nodes[node_idx].text_ptr = NULL;
                 doc->nodes[node_idx].text_len = 0;
@@ -745,12 +756,19 @@ static void wiki_preprocess(const char *text, int len, pp_doc *doc) {
 
             /* Start a new part in the top stack frame */
             pp_stack_frame *frame = &stack[stack_depth - 1];
-            int new_part = pp_alloc_part(doc);
             if (frame->nparts < PP_MAX_FRAME_PARTS) {
-                frame->part_indices[frame->nparts] = new_part;
-                frame->nparts++;
+                int new_part = pp_alloc_part(doc);
+                if (new_part >= 0) {
+                    frame->part_indices[frame->nparts] = new_part;
+                    frame->nparts++;
+                    current_part = new_part;
+                }
+            } else {
+                /* Frame is at its part cap: keep the content in the
+                   current (last) part with a literal pipe, so nothing
+                   is silently dropped. */
+                pp_emit_text(doc, current_part, text + i, 1);
             }
-            current_part = new_part;
 
             text_start = i + 1;
             i++;
@@ -1250,11 +1268,16 @@ static void format_number(double val, rp_string *out) {
     }
 }
 
-/* formatnum: add thousands separators */
+/* formatnum: add thousands separators.  Grouping is applied ONLY when
+   the integer part is purely ASCII digits: MediaWiki passes non-numeric
+   input through unchanged, and grouping arbitrary bytes would insert
+   commas inside words and split multibyte UTF-8 sequences (e.g.
+   {{USD|50–90 million}} would get a comma inside the en-dash bytes,
+   producing invalid UTF-8). */
 static void format_num_str(const char *s, int slen, rp_string *out) {
     /* Find the integer part */
     int start = 0;
-    if (slen > 0 && s[0] == '-') { rp_string_putc(out, '-'); start = 1; }
+    if (slen > 0 && s[0] == '-') start = 1;
 
     /* Find decimal point */
     int dot = -1;
@@ -1263,6 +1286,14 @@ static void format_num_str(const char *s, int slen, rp_string *out) {
     }
     int int_end = (dot >= 0) ? dot : slen;
     int int_len = int_end - start;
+
+    /* Non-numeric or empty integer part: pass through untouched */
+    if (int_len <= 0) { rp_string_putsn(out, s, slen); return; }
+    for (int i = start; i < int_end; i++) {
+        if (s[i] < '0' || s[i] > '9') { rp_string_putsn(out, s, slen); return; }
+    }
+
+    if (start) rp_string_putc(out, '-');
 
     /* Add integer part with commas */
     for (int i = 0; i < int_len; i++) {
@@ -1295,10 +1326,15 @@ static int call_parser_function(expand_ctx *ec, slice_t funcname,
 
     if (strcmp(fname, "#if") == 0) {
         slice_t test = (nargs > 0) ? expand_and_trim(ec, args[0], depth + 1, buf1) : make_slice("", 0);
+        /* MediaWiki trims parser-function arguments (templates escape a
+           wanted leading space as &#32;), so result branches expand trimmed
+           -- otherwise multi-line template sources leak newlines into
+           mid-sentence prose ("US$\n50").  Applies to all branch sites
+           below. */
         if (test.len > 0) {
-            if (nargs > 1) expand_slice(ec, args[1], depth + 1, out);
+            if (nargs > 1) expand_slice(ec, slice_trim(args[1]), depth + 1, out);
         } else {
-            if (nargs > 2) expand_slice(ec, args[2], depth + 1, out);
+            if (nargs > 2) expand_slice(ec, slice_trim(args[2]), depth + 1, out);
         }
     }
     else if (strcmp(fname, "#ifeq") == 0) {
@@ -1319,9 +1355,9 @@ static int call_parser_function(expand_ctx *ec, slice_t funcname,
                 eq = (n1 == n2);
         }
         if (eq) {
-            if (nargs > 2) expand_slice(ec, args[2], depth + 1, out);
+            if (nargs > 2) expand_slice(ec, slice_trim(args[2]), depth + 1, out);
         } else {
-            if (nargs > 3) expand_slice(ec, args[3], depth + 1, out);
+            if (nargs > 3) expand_slice(ec, slice_trim(args[3]), depth + 1, out);
         }
     }
     else if (strcmp(fname, "#switch") == 0) {
@@ -1349,7 +1385,7 @@ static int call_parser_function(expand_ctx *ec, slice_t funcname,
                 slice_t result_val = make_slice(args[i].ptr + eqpos + 1, args[i].len - eqpos - 1);
 
                 if (found || (cv.len == primary.len && memcmp(cv.ptr, primary.ptr, cv.len) == 0)) {
-                    expand_slice(ec, result_val, depth + 1, out);
+                    expand_slice(ec, slice_trim(result_val), depth + 1, out);
                     goto switch_done;
                 }
                 if (slice_eq(cv, "#default", 8)) {
@@ -1367,7 +1403,7 @@ static int call_parser_function(expand_ctx *ec, slice_t funcname,
         }
         /* Default */
         if (default_val.ptr) {
-            expand_slice(ec, default_val, depth + 1, out);
+            expand_slice(ec, slice_trim(default_val), depth + 1, out);
         }
         switch_done: ;
     }
@@ -1382,24 +1418,24 @@ static int call_parser_function(expand_ctx *ec, slice_t funcname,
         slice_t val = (nargs > 0) ? expand_and_trim(ec, args[0], depth + 1, buf1) : make_slice("", 0);
         double r = (val.len > 0) ? eval_expr_str(val.ptr, val.len) : 0;
         if (r != 0) {
-            if (nargs > 1) expand_slice(ec, args[1], depth + 1, out);
+            if (nargs > 1) expand_slice(ec, slice_trim(args[1]), depth + 1, out);
         } else {
-            if (nargs > 2) expand_slice(ec, args[2], depth + 1, out);
+            if (nargs > 2) expand_slice(ec, slice_trim(args[2]), depth + 1, out);
         }
     }
     else if (strcmp(fname, "#ifexist") == 0) {
         /* Always take the "does not exist" branch — we can't check LMDB from C easily */
-        if (nargs > 2) expand_slice(ec, args[2], depth + 1, out);
-        else if (nargs > 1) expand_slice(ec, args[1], depth + 1, out);
+        if (nargs > 2) expand_slice(ec, slice_trim(args[2]), depth + 1, out);
+        else if (nargs > 1) expand_slice(ec, slice_trim(args[1]), depth + 1, out);
     }
     else if (strcmp(fname, "#iferror") == 0) {
         rp_string_clear(buf1);
         if (nargs > 0) expand_slice(ec, args[0], depth + 1, buf1);
         int is_error = (memmem(buf1->str, buf1->len, "class=\"error\"", 13) != NULL);
         if (is_error) {
-            if (nargs > 1) expand_slice(ec, args[1], depth + 1, out);
+            if (nargs > 1) expand_slice(ec, slice_trim(args[1]), depth + 1, out);
         } else {
-            if (nargs > 2) expand_slice(ec, args[2], depth + 1, out);
+            if (nargs > 2) expand_slice(ec, slice_trim(args[2]), depth + 1, out);
             else rp_string_putsn(out, buf1->str, buf1->len);
         }
     }
@@ -2322,8 +2358,7 @@ static void strip_wiki_markup(const char *text, int len, rp_string *out,
                         }
                         if (memmem(val.ptr, val.len, "bgcolor", 7) ||
                             memmem(val.ptr, val.len, "colspan", 7) ||
-                            memmem(val.ptr, val.len, "rowspan", 7) ||
-                            memmem(val.ptr, val.len, "nvo,ke", 6)) continue;
+                            memmem(val.ptr, val.len, "rowspan", 7)) continue;
 
                         if (emitted > 0) {
                             int opos = (int)out->len;
@@ -2565,9 +2600,6 @@ static void filter_debris(const char *text, int len, rp_string *out,
 
             /* CSS: color:#hex */
             if (!discard && dlen < 40 && memmem(dp, dlen, ":#", 2)) discard = 1;
-
-            /* invoke: debris */
-            if (!discard && memmem(dp, dlen, "nvo,ke", 6)) discard = 1;
 
             /* Very short non-alpha lines (but preserve {| and |} for table handling) */
             if (!discard && dlen < 5) {
