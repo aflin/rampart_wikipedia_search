@@ -18,11 +18,10 @@
    Usage:  rampart mkindex.js [lang_code]
 
    Notes on the metamorph index options:
-     WITH WORDEXPRESSIONS defines what counts as a word (thunderstone
-     rex syntax, not perl regex):
-       https://docs.thunderstone.com/site/texisman/rex_expression_syntax.html
-       https://docs.thunderstone.com/site/texisman/creating_a_metamorph_index.html
-     INDEXMETER 'on' prints creation progress.
+     The default word expression ([\uword]{2,99}: Unicode letters,
+     digits and combining marks, matched as whole utf-8 characters)
+     handles every script, so no WITH WORDEXPRESSIONS override is
+     needed; INDEXMETER 'on' prints creation progress.
 */
 
 rampart.globalize(rampart.utils);
@@ -55,9 +54,15 @@ function indexExists(x) {
     return !!sql.one("select * from SYSINDEX where NAME=?", [x]);
 }
 
-var MM_OPTS = "WITH WORDEXPRESSIONS " +
-    "('[\\alnum\\x80-\\xFF]{2,99}', '[\\alnum\\$%@\\-_\\+]{2,99}') " +
-    "INDEXMETER 'on'";
+/* Word expressions are stored in the index and applied to query terms
+   at search time, so tokenization lives entirely here.
+
+   The default word expression ([\uword]{2,99}: Unicode letters,
+   digits and combining marks, matched as whole utf-8 characters)
+   breaks words correctly at ZWNJ, punctuation and all other non-word
+   codepoints in any script, so no WORDEXPRESSIONS override is
+   needed. */
+var MM_OPTS = "WITH INDEXMETER 'on'";
 
 var did = 0, skipped = 0;
 
