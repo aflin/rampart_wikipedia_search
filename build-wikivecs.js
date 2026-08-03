@@ -327,7 +327,19 @@ function workerFunc(arg) {
         });
     }
 
+    /* Resume: an article that is already embedded needs no work, and
+       deciding that takes only its Id.  In dump mode this runs as
+       extract()'s pre-parse filter, so a skip costs one indexed lookup
+       instead of a full template expansion. */
+    function alreadyEmbedded(id) {
+        var row = sql.one("select Vec from wikivecs where Id = ?", [id]);
+        if (row && row.Vec) { mySkipped++; return true; }
+        return false;
+    }
+
     function insertArticle(id, title, doc) {
+        /* dump mode filtered these out before parsing; sql mode (and a
+           null/0 id, which the filter cannot trust) still checks here */
         var existing = arg.resume ?
             sql.one("select Vec from wikivecs where Id = ?", [id]) : null;
         if (existing && existing.Vec) {
@@ -376,6 +388,21 @@ function workerFunc(arg) {
                 insertArticle(parseInt(id) || 0, title, text);
             }
         };
+        if (arg.resume) {
+            extractOpts.filter = function (title, id) {
+                id = parseInt(id) || 0;
+                /* id 0 means the dump gave no usable page id: fall through
+                   and let insertArticle sort it out with the text in hand */
+                if (!id) return true;
+                if (!alreadyEmbedded(id)) return true;
+                /* count it as processed, as the pre-filter code did, but
+                   report on a stride: a skip costs microseconds now, and
+                   a thread.put per skip would outweigh the lookup */
+                myCount++;
+                if (!(myCount % 200)) report();
+                return false;
+            };
+        }
         if (arg.endKey) extractOpts.endKey = arg.endKey;
         wp.extract(g_FILE, g_lmdbPath, extractOpts);
     }

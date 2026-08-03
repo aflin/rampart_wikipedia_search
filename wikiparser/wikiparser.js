@@ -10,6 +10,11 @@
         // Step 2: Extract articles
         wikiparser.extract(dumpFile, lmdbPath, {
             callback: function(title, id, text, progress) { ... },
+            filter: function(title, id) { return true; },
+                                    // optional; called BEFORE the article is
+                                    // parsed.  Return false to skip it —
+                                    // nothing is expanded, so a resuming
+                                    // build pays a lookup, not a parse.
             limit: 100,
             startKey: "A",          // start from this title prefix
             endKey: "B",            // stop at this title prefix
@@ -776,6 +781,10 @@ function extract(dumpFile, lmdbPath, options) {
     if (typeof callback !== 'function')
         throw new Error("wikiparser.extract: options.callback must be a function");
 
+    var filter = options.filter;
+    if (filter !== undefined && typeof filter !== 'function')
+        throw new Error("wikiparser.extract: options.filter must be a function");
+
     var maxPages = options.limit || 0;
     var progressInterval = (options.progressInterval === undefined) ? 1000 : options.progressInterval;
     if (progressInterval === null || progressInterval < 1) progressInterval = 0;
@@ -810,7 +819,7 @@ function extract(dumpFile, lmdbPath, options) {
     var txn = new lmdb.transaction(db, false);
     var row = txn.cursorGet(lmdb.op_setRange, startCursor, true);
 
-    var count = 0, skipped = 0, errors = 0;
+    var count = 0, skipped = 0, filtered = 0, errors = 0;
     var startTime = performance.now();
 
     while (row && row.key && row.key.indexOf("0:") === 0) {
@@ -820,6 +829,14 @@ function extract(dumpFile, lmdbPath, options) {
         var entry = CBOR.decode(row.value);
         if (!entry.redirect) {
             var title = row.key.substring(2);
+            /* Pre-parse filter: the caller may already have this article
+               (a resuming build).  Ask BEFORE expanding — the Id is known
+               here, and expansion is the expensive part. */
+            if (filter && !filter(title, entry.id || "0")) {
+                filtered++;
+                row = txn.cursorNext(true);
+                continue;
+            }
             try {
                 var text = processArticle(title, siteinfo, staticMW);
                 if (text && text.length > 0) {
@@ -863,6 +880,7 @@ function extract(dumpFile, lmdbPath, options) {
     return {
         articles: count,
         skipped: skipped,
+        filtered: filtered,   /* rejected by options.filter, never parsed */
         errors: errors,
         elapsed: elapsed,
         rate: count / elapsed

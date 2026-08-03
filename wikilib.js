@@ -132,9 +132,33 @@ function chooseEngine(alias, override) {
  * portable: copy it anywhere and the alias re-resolves.
  * ------------------------------------------------------------------ */
 
-/* Resolve (and download if needed) the model file for `alias` on `engine`,
- * returning its ~/.rampart/models path.  For onnx that is the .onnx file
- * inside the model directory -- exactly what onnxEmbed wants. */
+/* Resolve (and download if needed) the model for `alias` on `engine`,
+ * returning its ~/.rampart/models path: the .gguf file for llamacpp, the
+ * model DIRECTORY for onnx.
+ *
+ * rampart-models hands back the bare .onnx file, but the directory is the
+ * documented entry point for both onnx.initEmbed() and onnx.initRerank(),
+ * and only directory mode discovers the tokenizer, pooling and token
+ * window from the model's own config files.  A bare .onnx is "file mode",
+ * which makes an explicit tokenizer_path mandatory (sql.set fails without
+ * it) and skips pooling discovery entirely -- so a sentence-transformers
+ * model that did load would embed with the wrong pooling.
+ *
+ * The one thing the directory loses is which precision was fetched:
+ * rampart-onnx picks onnx/model.onnx, else model.onnx, else the first
+ * *.onnx it finds.  Nothing here asks for a precision, so each alias
+ * holds only its default fp16 download and the choice is unambiguous --
+ * but a caller that fetched a second precision for the same alias (e.g.
+ * ensureReranker({precision:'q4'})) would leave two files in one
+ * directory, and the load could pick either. */
+function onnxModelDir(p) {
+    var st = u.stat(p);
+    if (st && st.isDirectory) return p;         /* already a directory */
+    var dir = p.replace(/\/[^\/]*$/, "");       /* strip the file name */
+    if (/\/onnx$/.test(dir)) dir = dir.replace(/\/onnx$/, "");
+    return (u.stat(dir) || {}).isDirectory ? dir : p;
+}
+
 function resolveModel(alias, engine, opts) {
     opts = opts || {};
     var o = { progress: opts.progress !== false,
@@ -143,7 +167,8 @@ function resolveModel(alias, engine, opts) {
                            alias, info.format, info.repo, info.size, info.dest);
                   return true;
               } };
-    return engine === "gguf" ? models.ggufGet(alias, o) : models.onnxGet(alias, o);
+    if (engine === "gguf") return models.ggufGet(alias, o);
+    return onnxModelDir(models.onnxGet(alias, o));
 }
 
 /* Kept for the build path + reranker: ensure the model is on disk and

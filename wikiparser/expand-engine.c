@@ -1812,9 +1812,14 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
     int nparts = split_parts(inner, inner_len, parts, MAX_PARTS);
     if (nparts == 0) return;
 
-    /* Expand the template name */
+    /* Expand the template name.  Comments are stripped first: MediaWiki
+       removes them in the preprocessor, and a comment sitting before the
+       first | is part of the name slice.  Infobox boilerplate puts a
+       template CALL inside that comment ("<!-- See {{Infobox settlement}}
+       for the full list of fields -->"), which would otherwise expand
+       into the name and bury the real one under kilobytes of markup. */
     rp_string *name_buf = rp_string_new(256);
-    wiki_expand(ec, parts[0].ptr, parts[0].len, depth + 1, name_buf);
+    expand_value_sans_comments(ec, parts[0], depth + 1, name_buf);
 
     /* Trim the name */
     const char *np = name_buf->str;
@@ -1831,7 +1836,20 @@ static void expand_single_template(expand_ctx *ec, const char *inner, int inner_
 
     /* Capitalize first letter */
     char name_copy[4096];
-    if (nlen >= (int)sizeof(name_copy)) nlen = (int)sizeof(name_copy) - 1;
+    if (nlen >= (int)sizeof(name_copy)) {
+        nlen = (int)sizeof(name_copy) - 1;
+        /* Never cut a UTF-8 sequence in half: the name reaches JS as a
+           string, and an invalid one makes duktape throw "internal
+           error", which would lose the whole article. */
+        int k = nlen;
+        while (k > 0 && ((unsigned char)np[k-1] & 0xC0) == 0x80) k--;
+        if (k > 0) {
+            unsigned char lead = (unsigned char)np[k-1];
+            int need = (lead < 0x80) ? 1 : (lead >= 0xF0) ? 4 :
+                       (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
+            if (k - 1 + need > nlen) nlen = k - 1;
+        }
+    }
     memcpy(name_copy, np, nlen);
     name_copy[nlen] = '\0';
     if (nlen > 0 && name_copy[0] >= 'a' && name_copy[0] <= 'z')
