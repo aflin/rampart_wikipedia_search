@@ -3252,7 +3252,7 @@ static void cleanup_expanded_text(const char *text, int len, rp_string *out,
             p++;
             continue;
         }
-    resume_normal:
+    resume_normal: ;   /* empty statement required for pre C23 */
 
         unsigned char c = (unsigned char)*p;
 
